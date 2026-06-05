@@ -1,3 +1,7 @@
 # Global ML compatibility constraints
 # Keep NumPy on the 1.x ABI required by the current Whisper/TTS stack.
 numpy==1.26.4
+# Keep transformers on 4.x — TTS 0.22.0 uses BeamSearchScorer which was
+# removed in transformers 5.x, and torch 2.2.2 is below the 2.4 minimum
+# that transformers 5.x requires.
+transformers<5.0.0
