@@ -1,10 +1,9 @@
 """
-Telegram Bot — Media Manager con almacenamiento nativo de Telegram
-===================================================================
-• No requiere Google Drive ni ninguna nube externa
-• Los archivos se almacenan en los servidores de Telegram (file_id)
-• Sistema de álbumes estilo Google Photos
-• Corre permanentemente en Hugging Face Spaces o cualquier servidor
+Telegram Bot — Media Manager with native Telegram storage
+==========================================================
+• No external cloud required — files are stored on Telegram's servers (file_id)
+• Album system inspired by modern photo gallery apps
+• Runs continuously on Hugging Face Spaces or any server
 """
 
 import os
@@ -20,10 +19,10 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8488403540:AAEoPyCMze1FKeNW94
 _data_dir = os.environ.get("DATA_DIR", "/app/data")
 DB_PATH = os.path.join(_data_dir, "media.db")
 
-# ── Estados del ConversationHandler ───────────────────────────────────────────
+# ── ConversationHandler states ────────────────────────────────────────────────
 (ASK_ALBUM_NAME,) = range(1)
 
-# ── Base de datos SQLite ───────────────────────────────────────────────────────
+# ── SQLite database ───────────────────────────────────────────────────────────
 def init_db():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -55,9 +54,9 @@ def init_db():
     """)
     con.commit()
     con.close()
-    log.info("Base de datos inicializada")
+    log.info("Database initialized")
 
-# ── Queries ────────────────────────────────────────────────────────────────────
+# ── Queries ───────────────────────────────────────────────────────────────────
 def get_albums(telegram_id: int):
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -109,7 +108,7 @@ def add_media(telegram_id, album_id, file_id, file_unique_id, media_type,
          file_name, mime_type, size_bytes, width, height, duration,
          datetime.utcnow().isoformat())
     )
-    # Si el álbum no tiene portada, asignarla
+    # Set cover if the album doesn't have one yet
     if album_id:
         con.execute(
             "UPDATE albums SET cover_file_id=? WHERE id=? AND cover_file_id IS NULL",
@@ -188,7 +187,7 @@ def move_to_album(file_unique_id: str, telegram_id: int, album_id):
     con.commit(); con.close()
 
 def get_pending_album(telegram_id: int):
-    """Obtiene file_unique_id pendiente de asignar a álbum."""
+    """Returns the most recent file_unique_id pending album assignment."""
     con = sqlite3.connect(DB_PATH)
     row = con.execute(
         "SELECT file_unique_id FROM media WHERE telegram_id=? ORDER BY id DESC LIMIT 1",
@@ -197,7 +196,7 @@ def get_pending_album(telegram_id: int):
     con.close()
     return row[0] if row else None
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def fmt_size(b: int) -> str:
     if b < 1024: return f"{b} B"
     if b < 1024**2: return f"{b//1024} KB"
@@ -205,60 +204,59 @@ def fmt_size(b: int) -> str:
 
 def fmt_date(iso: str) -> str:
     try:
-        return datetime.fromisoformat(iso).strftime("%d/%m/%Y %H:%M")
+        return datetime.fromisoformat(iso).strftime("%b %d, %Y · %H:%M")
     except Exception:
         return iso[:16]
 
 PAGE_SIZE = 10
 
-# ── /start ─────────────────────────────────────────────────────────────────────
+# ── /start ────────────────────────────────────────────────────────────────────
 async def cmd_start(update, ctx):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     kb = [
-        [InlineKeyboardButton("📸 Mis fotos",    callback_data="browse:photo:0"),
-         InlineKeyboardButton("🎬 Mis videos",   callback_data="browse:video:0")],
-        [InlineKeyboardButton("🗂 Álbumes",       callback_data="albums_menu"),
-         InlineKeyboardButton("📊 Estadísticas", callback_data="stats")],
-        [InlineKeyboardButton("❓ Ayuda",         callback_data="help")],
+        [InlineKeyboardButton("📸 Photos",    callback_data="browse:photo:0"),
+         InlineKeyboardButton("🎬 Videos",    callback_data="browse:video:0")],
+        [InlineKeyboardButton("🗂 Albums",    callback_data="albums_menu"),
+         InlineKeyboardButton("📊 Insights",  callback_data="stats")],
+        [InlineKeyboardButton("❓ Help",       callback_data="help")],
     ]
     await update.message.reply_text(
-        "📱 *Bienvenido a tu galería de Telegram*\n\n"
-        "Envíame fotos, videos, audios o documentos y los organizo por ti.\n"
-        "Crea álbumes para agrupar tu contenido. ¡Todo queda guardado en Telegram!\n\n"
-        "👇 Elige una opción:",
+        "📱 *Welcome to your personal gallery*\n\n"
+        "Send me photos, videos, audio, or documents and I'll keep them organized.\n"
+        "Create albums to group your content — everything is stored securely on Telegram.\n\n"
+        "What would you like to do?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
-# ── /ayuda ─────────────────────────────────────────────────────────────────────
-async def cmd_ayuda(update, ctx):
+# ── /help ─────────────────────────────────────────────────────────────────────
+async def cmd_help(update, ctx):
     await update.message.reply_text(
-        "📚 *Cómo usar el bot:*\n\n"
-        "1️⃣ Envía fotos, videos o archivos directamente.\n"
-        "2️⃣ Tras recibir el archivo, elige en qué álbum guardarlo.\n"
-        "3️⃣ Explora tu galería con /galeria o los botones.\n\n"
-        "📌 *Comandos:*\n"
-        "/start — Menú principal\n"
-        "/galeria — Ver toda la galería\n"
-        "/albumes — Gestionar álbumes\n"
-        "/nuevo\\_album — Crear un álbum\n"
-        "/stats — Estadísticas\n"
-        "/ayuda — Esta ayuda\n\n"
-        "💡 *Tip:* Puedes enviar varias fotos a la vez y elegir el álbum.",
+        "📚 *How it works*\n\n"
+        "1️⃣ Send any photo, video, audio, or file.\n"
+        "2️⃣ Choose which album to save it to — or skip.\n"
+        "3️⃣ Browse your gallery anytime with /gallery or the buttons below.\n\n"
+        "📌 *Commands*\n"
+        "/start — Main menu\n"
+        "/gallery — Browse your gallery\n"
+        "/albums — Manage albums\n"
+        "/new\\_album — Create a new album\n"
+        "/stats — Your storage insights\n"
+        "/help — This guide\n\n"
+        "💡 *Tip:* You can send multiple files at once and assign them to the same album.",
         parse_mode="Markdown"
     )
 
 async def cb_help(update, ctx):
     await update.callback_query.answer()
-    await cmd_ayuda(update, ctx)
+    await cmd_help(update, ctx)
 
-# ── Recibir media ──────────────────────────────────────────────────────────────
+# ── Receive media ─────────────────────────────────────────────────────────────
 async def _save_media(update, ctx, media_type: str):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     tid = update.effective_user.id
     msg = update.message
 
-    # Extraer datos según tipo
     if media_type == "photo":
         obj = msg.photo[-1]
         file_id, file_unique_id = obj.file_id, obj.file_unique_id
@@ -287,18 +285,17 @@ async def _save_media(update, ctx, media_type: str):
         file_id, file_unique_id = obj.file_id, obj.file_unique_id
         width, height, duration = None, None, None
         size_bytes = obj.file_size or 0
-        file_name = obj.file_name or "archivo"
+        file_name = obj.file_name or "file"
         mime_type = obj.mime_type or "application/octet-stream"
 
-    # Guardar sin álbum primero
+    # Save without album first
     add_media(tid, None, file_id, file_unique_id, media_type,
               file_name, mime_type, size_bytes, width, height, duration)
 
-    # Guardar en ctx para asignar álbum
     ctx.user_data["last_file_unique_id"] = file_unique_id
     ctx.user_data["last_media_type"] = media_type
 
-    # Botones: álbumes existentes + sin álbum + nuevo álbum
+    # Buttons: existing albums + no album + new album
     albums = get_albums(tid)
     kb = []
     row = []
@@ -312,18 +309,18 @@ async def _save_media(update, ctx, media_type: str):
     if row:
         kb.append(row)
     kb.append([
-        InlineKeyboardButton("📁 Sin álbum",    callback_data=f"assign:{file_unique_id}:none"),
-        InlineKeyboardButton("➕ Nuevo álbum",  callback_data=f"newalbum:{file_unique_id}")
+        InlineKeyboardButton("📁 No album",      callback_data=f"assign:{file_unique_id}:none"),
+        InlineKeyboardButton("➕ New album",      callback_data=f"newalbum:{file_unique_id}")
     ])
 
     ICONS = {"photo": "🖼", "video": "🎬", "audio": "🎵", "document": "📄"}
     icon = ICONS.get(media_type, "📁")
 
     await msg.reply_text(
-        f"{icon} *{file_name}* guardado\\!\n"
+        f"{icon} *{file_name}* saved\n"
         f"📏 {fmt_size(size_bytes)}\n\n"
-        "¿En qué álbum lo guardamos?",
-        parse_mode="MarkdownV2",
+        "Which album should this go into?",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
@@ -332,7 +329,7 @@ async def handle_video(update, ctx):    await _save_media(update, ctx, "video")
 async def handle_audio(update, ctx):    await _save_media(update, ctx, "audio")
 async def handle_document(update, ctx): await _save_media(update, ctx, "document")
 
-# ── Asignar a álbum ────────────────────────────────────────────────────────────
+# ── Assign to album ───────────────────────────────────────────────────────────
 async def cb_assign_album(update, ctx):
     await update.callback_query.answer()
     tid = update.effective_user.id
@@ -342,20 +339,20 @@ async def cb_assign_album(update, ctx):
 
     if album_id:
         album = get_album(album_id, tid)
-        name = album["name"] if album else "álbum"
-        text = f"✅ Añadido al álbum *{name}*"
+        name = album["name"] if album else "album"
+        text = f"✅ Added to *{name}*"
     else:
-        text = "✅ Guardado sin álbum"
+        text = "✅ Saved without an album"
 
     await update.callback_query.message.edit_text(text, parse_mode="Markdown")
 
-# ── Crear álbum desde media ────────────────────────────────────────────────────
+# ── Create album from media ───────────────────────────────────────────────────
 async def cb_newalbum_for_file(update, ctx):
     await update.callback_query.answer()
     _, file_unique_id = update.callback_query.data.split(":", 1)
     ctx.user_data["pending_file_for_album"] = file_unique_id
     await update.callback_query.message.reply_text(
-        "📝 ¿Cómo se llamará el nuevo álbum?"
+        "📝 What would you like to name this album?"
     )
     return ASK_ALBUM_NAME
 
@@ -365,17 +362,17 @@ async def recv_album_name(update, ctx):
     tid = update.effective_user.id
     name = update.message.text.strip()
     if not name:
-        await update.message.reply_text("El nombre no puede estar vacío. Intenta de nuevo:")
+        await update.message.reply_text("Album name can't be empty. Please try again:")
         return ASK_ALBUM_NAME
     album_id = create_album(tid, name)
     file_unique_id = ctx.user_data.pop("pending_file_for_album", None)
     if file_unique_id:
         move_to_album(file_unique_id, tid, album_id)
     ctx.user_data.clear()
-    kb = [[InlineKeyboardButton(f"📂 Ver {name}", callback_data=f"album:{album_id}:0")]]
+    kb = [[InlineKeyboardButton(f"📂 Open {name}", callback_data=f"album:{album_id}:0")]]
     await update.message.reply_text(
-        f"✅ Álbum *{name}* creado y archivo añadido\\!",
-        parse_mode="MarkdownV2",
+        f"✅ Album *{name}* created and file added.",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
     return ConversationHandler.END
@@ -383,39 +380,39 @@ async def recv_album_name(update, ctx):
 async def cancel_conv(update, ctx):
     from telegram.ext import ConversationHandler
     ctx.user_data.clear()
-    await update.message.reply_text("Cancelado.")
+    await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
-# ── /nuevo_album ───────────────────────────────────────────────────────────────
-async def cmd_nuevo_album(update, ctx):
+# ── /new_album ────────────────────────────────────────────────────────────────
+async def cmd_new_album(update, ctx):
     ctx.user_data["pending_file_for_album"] = None
-    await update.message.reply_text("📝 ¿Cómo se llamará el nuevo álbum?")
+    await update.message.reply_text("📝 What would you like to name this album?")
     return ASK_ALBUM_NAME
 
-# ── /albumes ──────────────────────────────────────────────────────────────────
-async def cmd_albumes(update, ctx):
+# ── /albums ───────────────────────────────────────────────────────────────────
+async def cmd_albums(update, ctx):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     tid = update.effective_user.id
     albums = get_albums(tid)
     if not albums:
-        kb = [[InlineKeyboardButton("➕ Crear álbum", callback_data="create_album_menu")]]
+        kb = [[InlineKeyboardButton("➕ Create album", callback_data="create_album_menu")]]
         await update.message.reply_text(
-            "No tienes álbumes aún. ¡Crea el primero!",
+            "You don't have any albums yet. Create your first one.",
             reply_markup=InlineKeyboardMarkup(kb)
         )
         return
     kb = []
     for a in albums:
         kb.append([InlineKeyboardButton(
-            f"🗂 {a['name']} · {a['total']} archivos",
+            f"🗂 {a['name']} · {a['total']} files",
             callback_data=f"album:{a['id']}:0"
         )])
     kb.append([
-        InlineKeyboardButton("➕ Nuevo álbum", callback_data="create_album_menu"),
-        InlineKeyboardButton("🏠 Inicio",       callback_data="main_menu")
+        InlineKeyboardButton("➕ New album",  callback_data="create_album_menu"),
+        InlineKeyboardButton("🏠 Home",        callback_data="main_menu")
     ])
     await update.message.reply_text(
-        f"🗂 *Tus álbumes* ({len(albums)})\n\nElige uno para ver su contenido:",
+        f"🗂 *Your Albums* ({len(albums)})\n\nSelect an album to view its contents:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
@@ -426,25 +423,25 @@ async def cb_albums_menu(update, ctx):
     albums = get_albums(tid)
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     if not albums:
-        kb = [[InlineKeyboardButton("➕ Crear álbum", callback_data="create_album_menu"),
-               InlineKeyboardButton("🏠 Inicio",       callback_data="main_menu")]]
+        kb = [[InlineKeyboardButton("➕ Create album", callback_data="create_album_menu"),
+               InlineKeyboardButton("🏠 Home",          callback_data="main_menu")]]
         await update.callback_query.message.edit_text(
-            "No tienes álbumes aún. ¡Crea el primero!",
+            "You don't have any albums yet. Create your first one.",
             reply_markup=InlineKeyboardMarkup(kb)
         )
         return
     kb = []
     for a in albums:
         kb.append([InlineKeyboardButton(
-            f"🗂 {a['name']} · {a['total']} archivos",
+            f"🗂 {a['name']} · {a['total']} files",
             callback_data=f"album:{a['id']}:0"
         )])
     kb.append([
-        InlineKeyboardButton("➕ Nuevo álbum", callback_data="create_album_menu"),
-        InlineKeyboardButton("🏠 Inicio",       callback_data="main_menu")
+        InlineKeyboardButton("➕ New album",  callback_data="create_album_menu"),
+        InlineKeyboardButton("🏠 Home",        callback_data="main_menu")
     ])
     await update.callback_query.message.edit_text(
-        f"🗂 *Tus álbumes* ({len(albums)})\n\nElige uno para ver su contenido:",
+        f"🗂 *Your Albums* ({len(albums)})\n\nSelect an album to view its contents:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
@@ -453,11 +450,11 @@ async def cb_create_album_menu(update, ctx):
     await update.callback_query.answer()
     ctx.user_data["pending_file_for_album"] = None
     await update.callback_query.message.reply_text(
-        "📝 ¿Cómo se llamará el nuevo álbum?\n\nEscribe el nombre:"
+        "📝 What would you like to name this album?\n\nType a name below:"
     )
     return ASK_ALBUM_NAME
 
-# ── Ver álbum ──────────────────────────────────────────────────────────────────
+# ── View album ────────────────────────────────────────────────────────────────
 async def cb_album_view(update, ctx):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     await update.callback_query.answer()
@@ -466,7 +463,7 @@ async def cb_album_view(update, ctx):
     album_id, page = int(parts[1]), int(parts[2])
     album = get_album(album_id, tid)
     if not album:
-        await update.callback_query.message.edit_text("Álbum no encontrado.")
+        await update.callback_query.message.edit_text("Album not found.")
         return
 
     offset = page * PAGE_SIZE
@@ -474,21 +471,20 @@ async def cb_album_view(update, ctx):
     total = count_media(tid, album_id=album_id)
 
     if not items:
-        kb = [[InlineKeyboardButton("🗂 Mis álbumes", callback_data="albums_menu"),
-               InlineKeyboardButton("🗑 Eliminar álbum", callback_data=f"del_album:{album_id}")]]
+        kb = [[InlineKeyboardButton("🗂 My Albums",     callback_data="albums_menu"),
+               InlineKeyboardButton("🗑 Delete Album",  callback_data=f"del_album:{album_id}")]]
         await update.callback_query.message.edit_text(
-            f"📂 *{album['name']}*\n\nEste álbum está vacío.",
+            f"📂 *{album['name']}*\n\nThis album is empty.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
         return
 
-    # Cabecera
     pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
     header = (
         f"📂 *{album['name']}*\n"
-        f"📅 Creado: {fmt_date(album['created_at'])}\n"
-        f"📦 {total} archivos · Página {page+1}/{pages}\n\n"
+        f"📅 Created: {fmt_date(album['created_at'])}\n"
+        f"📦 {total} files · Page {page+1} of {pages}\n\n"
     )
     ICONS = {"photo": "🖼", "video": "🎬", "audio": "🎵", "document": "📄"}
     lines = []
@@ -497,31 +493,30 @@ async def cb_album_view(update, ctx):
         lines.append(f"{icon} `{it['file_name'] or it['media_type']}` · {fmt_date(it['uploaded_at'])}")
     text = header + "\n".join(lines)
 
-    # Navegación
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("◀ Anterior", callback_data=f"album:{album_id}:{page-1}"))
+        nav.append(InlineKeyboardButton("◀ Previous", callback_data=f"album:{album_id}:{page-1}"))
     if page < pages - 1:
-        nav.append(InlineKeyboardButton("Siguiente ▶", callback_data=f"album:{album_id}:{page+1}"))
+        nav.append(InlineKeyboardButton("Next ▶",     callback_data=f"album:{album_id}:{page+1}"))
 
     kb = []
     if nav: kb.append(nav)
     kb.append([
-        InlineKeyboardButton("📤 Ver archivos", callback_data=f"send_album:{album_id}:{page}"),
-        InlineKeyboardButton("🗑 Eliminar álbum", callback_data=f"del_album:{album_id}")
+        InlineKeyboardButton("📤 View files",    callback_data=f"send_album:{album_id}:{page}"),
+        InlineKeyboardButton("🗑 Delete album",  callback_data=f"del_album:{album_id}")
     ])
     kb.append([
-        InlineKeyboardButton("🗂 Mis álbumes", callback_data="albums_menu"),
-        InlineKeyboardButton("🏠 Inicio",       callback_data="main_menu")
+        InlineKeyboardButton("🗂 My Albums",  callback_data="albums_menu"),
+        InlineKeyboardButton("🏠 Home",        callback_data="main_menu")
     ])
     await update.callback_query.message.edit_text(
         text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
     )
 
 async def cb_send_album(update, ctx):
-    """Envía los archivos del álbum como mensajes de Telegram."""
+    """Sends the album's files as Telegram messages."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    await update.callback_query.answer("Enviando archivos…")
+    await update.callback_query.answer("Sending files…")
     tid = update.effective_user.id
     parts = update.callback_query.data.split(":")
     album_id, page = int(parts[1]), int(parts[2])
@@ -543,9 +538,9 @@ async def cb_send_album(update, ctx):
             else:
                 await ctx.bot.send_document(chat_id, it["file_id"], caption=caption)
         except Exception as e:
-            log.warning(f"No se pudo reenviar {it['file_id']}: {e}")
+            log.warning(f"Could not forward {it['file_id']}: {e}")
 
-# ── Eliminar álbum ─────────────────────────────────────────────────────────────
+# ── Delete album ──────────────────────────────────────────────────────────────
 async def cb_delete_album(update, ctx):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     await update.callback_query.answer()
@@ -553,15 +548,15 @@ async def cb_delete_album(update, ctx):
     tid = update.effective_user.id
     album = get_album(album_id, tid)
     if not album:
-        await update.callback_query.message.edit_text("Álbum no encontrado.")
+        await update.callback_query.message.edit_text("Album not found.")
         return
     kb = [[
-        InlineKeyboardButton("✅ Sí, eliminar", callback_data=f"confirm_del_album:{album_id}"),
-        InlineKeyboardButton("❌ Cancelar",     callback_data=f"album:{album_id}:0")
+        InlineKeyboardButton("✅ Yes, delete",  callback_data=f"confirm_del_album:{album_id}"),
+        InlineKeyboardButton("❌ Cancel",        callback_data=f"album:{album_id}:0")
     ]]
     await update.callback_query.message.edit_text(
-        f"⚠️ ¿Eliminar el álbum *{album['name']}*?\n\n"
-        "Los archivos no se borran, solo se quitan del álbum.",
+        f"⚠️ Delete album *{album['name']}*?\n\n"
+        "Your files won't be deleted — they'll just be removed from this album.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
@@ -572,28 +567,28 @@ async def cb_confirm_delete_album(update, ctx):
     album_id = int(update.callback_query.data.split(":")[1])
     tid = update.effective_user.id
     album = get_album(album_id, tid)
-    name = album["name"] if album else "álbum"
+    name = album["name"] if album else "album"
     delete_album(album_id, tid)
-    kb = [[InlineKeyboardButton("🗂 Mis álbumes", callback_data="albums_menu")]]
+    kb = [[InlineKeyboardButton("🗂 My Albums", callback_data="albums_menu")]]
     await update.callback_query.message.edit_text(
-        f"🗑 Álbum *{name}* eliminado.",
+        f"🗑 *{name}* has been deleted.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
-# ── /galeria ──────────────────────────────────────────────────────────────────
-async def cmd_galeria(update, ctx):
+# ── /gallery ──────────────────────────────────────────────────────────────────
+async def cmd_gallery(update, ctx):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     kb = [
-        [InlineKeyboardButton("🖼 Fotos",       callback_data="browse:photo:0"),
+        [InlineKeyboardButton("🖼 Photos",      callback_data="browse:photo:0"),
          InlineKeyboardButton("🎬 Videos",      callback_data="browse:video:0")],
-        [InlineKeyboardButton("🎵 Audios",      callback_data="browse:audio:0"),
-         InlineKeyboardButton("📄 Documentos",  callback_data="browse:document:0")],
-        [InlineKeyboardButton("📦 Todo",        callback_data="browse:all:0"),
-         InlineKeyboardButton("🗂 Álbumes",     callback_data="albums_menu")],
+        [InlineKeyboardButton("🎵 Audio",        callback_data="browse:audio:0"),
+         InlineKeyboardButton("📄 Documents",   callback_data="browse:document:0")],
+        [InlineKeyboardButton("📦 All",          callback_data="browse:all:0"),
+         InlineKeyboardButton("🗂 Albums",       callback_data="albums_menu")],
     ]
     await update.message.reply_text(
-        "🖼 *Tu galería*\n\nElige qué quieres explorar:",
+        "🖼 *Your Gallery*\n\nWhat would you like to explore?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
@@ -609,22 +604,21 @@ async def cb_browse(update, ctx):
     items = get_media(tid, media_type=mt, limit=PAGE_SIZE, offset=offset)
     total = count_media(tid, media_type=mt)
 
-    LABELS = {"photo": "Fotos 🖼", "video": "Videos 🎬",
-              "audio": "Audios 🎵", "document": "Documentos 📄", "all": "Todo 📦"}
-    label = LABELS.get(mtype, "Archivos")
+    LABELS = {"photo": "Photos 🖼", "video": "Videos 🎬",
+              "audio": "Audio 🎵", "document": "Documents 📄", "all": "All 📦"}
+    label = LABELS.get(mtype, "Files")
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
 
     if not items:
         await update.callback_query.message.edit_text(
-            f"No tienes {label.lower()} aún.\nEnvíame archivos y los organizaré aquí."
+            f"No {label.lower()} yet.\nSend me some files and they'll show up here."
         )
         return
 
     ICONS = {"photo": "🖼", "video": "🎬", "audio": "🎵", "document": "📄"}
-    lines = [f"*{label}* — {total} archivos · Página {page+1}/{pages}\n"]
+    lines = [f"*{label}* — {total} files · Page {page+1} of {pages}\n"]
     for it in items:
         icon = ICONS.get(it["media_type"], "📁")
-        album_label = ""
         lines.append(
             f"{icon} `{it['file_name'] or it['media_type']}`\n"
             f"   📅 {fmt_date(it['uploaded_at'])} · {fmt_size(it['size_bytes'])}"
@@ -633,23 +627,23 @@ async def cb_browse(update, ctx):
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("◀ Anterior", callback_data=f"browse:{mtype}:{page-1}"))
+        nav.append(InlineKeyboardButton("◀ Previous", callback_data=f"browse:{mtype}:{page-1}"))
     if page < pages - 1:
-        nav.append(InlineKeyboardButton("Siguiente ▶", callback_data=f"browse:{mtype}:{page+1}"))
+        nav.append(InlineKeyboardButton("Next ▶",     callback_data=f"browse:{mtype}:{page+1}"))
 
     kb = []
     if nav: kb.append(nav)
     kb.append([
-        InlineKeyboardButton("📤 Enviar esta página", callback_data=f"send_browse:{mtype}:{page}"),
-        InlineKeyboardButton("🏠 Inicio",              callback_data="main_menu")
+        InlineKeyboardButton("📤 Send this page",  callback_data=f"send_browse:{mtype}:{page}"),
+        InlineKeyboardButton("🏠 Home",             callback_data="main_menu")
     ])
     await update.callback_query.message.edit_text(
         text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
     )
 
 async def cb_send_browse(update, ctx):
-    """Envía los archivos de la página actual de galería."""
-    await update.callback_query.answer("Enviando…")
+    """Sends the files on the current gallery page."""
+    await update.callback_query.answer("Sending…")
     tid = update.effective_user.id
     _, mtype, pg = update.callback_query.data.split(":")
     page = int(pg)
@@ -669,24 +663,24 @@ async def cb_send_browse(update, ctx):
             else:
                 await ctx.bot.send_document(chat_id, it["file_id"], caption=caption)
         except Exception as e:
-            log.warning(f"No se pudo reenviar {it['file_id']}: {e}")
+            log.warning(f"Could not forward {it['file_id']}: {e}")
 
-# ── Estadísticas ───────────────────────────────────────────────────────────────
+# ── Statistics ────────────────────────────────────────────────────────────────
 async def cmd_stats(update, ctx):
     tid = update.effective_user.id
     s = get_stats(tid)
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    kb = [[InlineKeyboardButton("🏠 Inicio", callback_data="main_menu")]]
+    kb = [[InlineKeyboardButton("🏠 Home", callback_data="main_menu")]]
     text = (
-        "📊 *Tus estadísticas*\n\n"
-        f"🖼 Fotos:       {s['photos']}\n"
-        f"🎬 Videos:      {s['videos']}\n"
-        f"🎵 Audios:      {s['audios']}\n"
-        f"📄 Documentos:  {s['docs']}\n"
-        f"📦 Total:       {s['total']}\n"
-        f"🗂 Álbumes:     {s['albums']}\n"
-        f"💾 Tamaño total: {fmt_size(s['total_size'])}\n\n"
-        "_Todo almacenado en los servidores de Telegram_"
+        "📊 *Your Insights*\n\n"
+        f"🖼 Photos:       {s['photos']}\n"
+        f"🎬 Videos:       {s['videos']}\n"
+        f"🎵 Audio:        {s['audios']}\n"
+        f"📄 Documents:    {s['docs']}\n"
+        f"📦 Total files:  {s['total']}\n"
+        f"🗂 Albums:       {s['albums']}\n"
+        f"💾 Storage used: {fmt_size(s['total_size'])}\n\n"
+        "_All files are stored securely on Telegram's servers_"
     )
     if update.message:
         await update.message.reply_text(text, parse_mode="Markdown",
@@ -699,24 +693,24 @@ async def cb_stats(update, ctx):
     await update.callback_query.answer()
     await cmd_stats(update, ctx)
 
-# ── Menú principal ─────────────────────────────────────────────────────────────
+# ── Main menu ─────────────────────────────────────────────────────────────────
 async def cb_main_menu(update, ctx):
     await update.callback_query.answer()
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     kb = [
-        [InlineKeyboardButton("📸 Fotos",       callback_data="browse:photo:0"),
+        [InlineKeyboardButton("📸 Photos",      callback_data="browse:photo:0"),
          InlineKeyboardButton("🎬 Videos",      callback_data="browse:video:0")],
-        [InlineKeyboardButton("🗂 Álbumes",     callback_data="albums_menu"),
-         InlineKeyboardButton("📊 Estadísticas", callback_data="stats")],
-        [InlineKeyboardButton("❓ Ayuda",        callback_data="help")],
+        [InlineKeyboardButton("🗂 Albums",       callback_data="albums_menu"),
+         InlineKeyboardButton("📊 Insights",    callback_data="stats")],
+        [InlineKeyboardButton("❓ Help",          callback_data="help")],
     ]
     await update.callback_query.message.edit_text(
-        "📱 *Menú principal*\n\nEnvíame archivos o elige una opción:",
+        "📱 *Home*\n\nSend me a file or choose an option below:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 def _build_app():
     from telegram.ext import (
         Application, CommandHandler, MessageHandler,
@@ -724,16 +718,16 @@ def _build_app():
     )
 
     if not TELEGRAM_TOKEN:
-        log.error("TELEGRAM_TOKEN no esta configurado. Agrega la variable de entorno TELEGRAM_TOKEN y reinicia el servicio.")
+        log.error("TELEGRAM_TOKEN is not set. Add the environment variable TELEGRAM_TOKEN and restart.")
         import sys; sys.exit(1)
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # ConversationHandler para crear álbum
-    # per_message=True evita el warning y funciona correctamente con callbacks
+    # ConversationHandler for album creation
+    # per_message=False works correctly with callbacks
     album_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("nuevo_album", cmd_nuevo_album),
+            CommandHandler("new_album", cmd_new_album),
             CallbackQueryHandler(cb_newalbum_for_file, pattern=r"^newalbum:"),
             CallbackQueryHandler(cb_create_album_menu, pattern="^create_album_menu$"),
         ],
@@ -747,12 +741,12 @@ def _build_app():
 
     application.add_handler(album_conv)
 
-    # Comandos
-    application.add_handler(CommandHandler("start",        cmd_start))
-    application.add_handler(CommandHandler("ayuda",        cmd_ayuda))
-    application.add_handler(CommandHandler("galeria",      cmd_galeria))
-    application.add_handler(CommandHandler("albumes",      cmd_albumes))
-    application.add_handler(CommandHandler("stats",        cmd_stats))
+    # Commands
+    application.add_handler(CommandHandler("start",      cmd_start))
+    application.add_handler(CommandHandler("help",       cmd_help))
+    application.add_handler(CommandHandler("gallery",    cmd_gallery))
+    application.add_handler(CommandHandler("albums",     cmd_albums))
+    application.add_handler(CommandHandler("stats",      cmd_stats))
 
     # Callbacks
     application.add_handler(CallbackQueryHandler(cb_main_menu,            pattern="^main_menu$"))
@@ -767,7 +761,7 @@ def _build_app():
     application.add_handler(CallbackQueryHandler(cb_browse,               pattern=r"^browse:"))
     application.add_handler(CallbackQueryHandler(cb_send_browse,          pattern=r"^send_browse:"))
 
-    # Media
+    # Media handlers
     application.add_handler(MessageHandler(filters.PHOTO,                    handle_photo))
     application.add_handler(MessageHandler(filters.VIDEO,                    handle_video))
     application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE,    handle_audio))
@@ -777,14 +771,13 @@ def _build_app():
 
 
 async def main_async():
-    """Corrutina principal — llamada desde app.py con su propio event loop."""
+    """Main coroutine — called from app.py with its own event loop."""
     application = _build_app()
-    log.info("Bot iniciado con polling")
+    log.info("Bot started with polling")
     async with application:
         await application.initialize()
         await application.start()
         await application.updater.start_polling(drop_pending_updates=True)
-        # Espera indefinida hasta señal de cierre
         import asyncio as _asyncio
         stop_event = _asyncio.Event()
         await stop_event.wait()
@@ -798,9 +791,9 @@ if __name__ == "__main__":
         log.error(
             "\n\n"
             "  ╔══════════════════════════════════════════════════════╗\n"
-            "  ║  TELEGRAM_TOKEN no está configurado                  ║\n"
-            "  ║  Agrega la variable de entorno en Railway:           ║\n"
-            "  ║  Settings → Variables → TELEGRAM_TOKEN = tu_token   ║\n"
+            "  ║  TELEGRAM_TOKEN is not configured                    ║\n"
+            "  ║  Add the environment variable to your deployment:    ║\n"
+            "  ║  Settings → Variables → TELEGRAM_TOKEN = your_token ║\n"
             "  ╚══════════════════════════════════════════════════════╝\n"
         )
         sys.exit(1)
