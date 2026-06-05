@@ -1,0 +1,20 @@
+# Telegram
+python-telegram-bot==21.6
+
+# Transcripción
+openai-whisper==20231117
+
+# Traducción offline
+argostranslate==1.9.6
+
+# Síntesis de voz con clonación (XTTS-v2)
+TTS==0.22.0
+
+# Audio/ML
+torch==2.2.2
+torchaudio==2.2.2
+numpy==1.26.4
+soundfile==0.12.1
+
+# Utilidades
+ffmpeg-python==0.2.0
