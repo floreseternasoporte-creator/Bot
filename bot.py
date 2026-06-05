@@ -21,6 +21,7 @@ import tempfile
 import shutil
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from uuid import uuid4
 
 logging.basicConfig(
@@ -29,10 +30,16 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8488403540:AAEoPyCMze1FKeNW94y-2Uf7QhXYC4qe4nc")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "dubbot.db"
+BOT_MODE = os.environ.get("BOT_MODE", "auto").strip().lower()
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "telegram-webhook").strip("/") or "telegram-webhook"
+WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN", "").strip() or None
+WEBHOOK_LISTEN = os.environ.get("WEBHOOK_LISTEN", "0.0.0.0")
+WEBHOOK_PORT = int(os.environ.get("PORT", os.environ.get("WEBHOOK_PORT", "8080")))
 
 # ── Idiomas soportados ─────────────────────────────────────────────────────────
 LANGUAGES = {
@@ -83,6 +90,44 @@ def store_pending_media(ctx, file_id, file_type):
         "file_type": file_type,
     }
     return media_key
+
+
+def get_public_webhook_url() -> str | None:
+    """Devuelve la URL pública del webhook si el entorno la proporciona."""
+    if WEBHOOK_URL:
+        return WEBHOOK_URL.rstrip("/")
+
+    railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if railway_domain:
+        return f"https://{railway_domain.rstrip('/')}/{WEBHOOK_PATH}"
+
+    return None
+
+
+def webhook_path_from_url(webhook_url: str) -> str:
+    """Extrae el path que debe escuchar PTB desde la URL pública del webhook."""
+    parsed = urlparse(webhook_url)
+    return parsed.path.strip("/") or WEBHOOK_PATH
+
+
+def should_use_webhook() -> tuple[bool, str | None]:
+    """Decide si arrancar en webhook o polling según BOT_MODE y entorno."""
+    webhook_url = get_public_webhook_url()
+
+    if BOT_MODE == "webhook":
+        if not webhook_url:
+            raise RuntimeError(
+                "BOT_MODE=webhook requiere WEBHOOK_URL o RAILWAY_PUBLIC_DOMAIN"
+            )
+        return True, webhook_url
+
+    if BOT_MODE == "polling":
+        return False, None
+
+    if BOT_MODE != "auto":
+        raise RuntimeError("BOT_MODE debe ser auto, webhook o polling")
+
+    return bool(webhook_url), webhook_url
 
 # ── Base de datos ──────────────────────────────────────────────────────────────
 def init_db():
@@ -405,6 +450,18 @@ async def cb_cancel_dub(update, ctx):
     await update.callback_query.message.edit_text("❌ Doblaje cancelado.")
 
 async def error_handler(update, ctx):
+    from telegram.error import Conflict
+
+    if isinstance(ctx.error, Conflict):
+        log.critical(
+            "Telegram rechazó el polling porque hay otra instancia usando "
+            "getUpdates con el mismo TELEGRAM_TOKEN. Detén la otra copia del "
+            "bot o usa BOT_MODE=webhook/WEBHOOK_URL. Cerrando esta instancia "
+            "para evitar conflictos repetidos."
+        )
+        ctx.application.stop_running()
+        return
+
     log.exception("Error no controlado en Telegram", exc_info=ctx.error)
     if update and getattr(update, "effective_message", None):
         try:
@@ -535,15 +592,31 @@ def _build_app():
 
     return app
 
-async def main_async():
+def run_bot():
     app = _build_app()
-    log.info("DubBot iniciado con polling")
-    async with app:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        stop = asyncio.Event()
-        await stop.wait()
+    use_webhook, webhook_url = should_use_webhook()
+
+    if use_webhook:
+        url_path = webhook_path_from_url(webhook_url)
+        log.info(
+            "DubBot iniciado con webhook en %s:%s/%s → %s",
+            WEBHOOK_LISTEN, WEBHOOK_PORT, url_path, webhook_url
+        )
+        app.run_webhook(
+            listen=WEBHOOK_LISTEN,
+            port=WEBHOOK_PORT,
+            url_path=url_path,
+            webhook_url=webhook_url,
+            secret_token=WEBHOOK_SECRET_TOKEN,
+            drop_pending_updates=True,
+        )
+        return
+
+    log.info(
+        "DubBot iniciado con polling. Si aparece un 409 Conflict, hay otra "
+        "instancia activa con el mismo TELEGRAM_TOKEN."
+    )
+    app.run_polling(drop_pending_updates=True, bootstrap_retries=0)
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
@@ -558,4 +631,4 @@ if __name__ == "__main__":
         sys.exit(1)
 
     init_db()
-    asyncio.run(main_async())
+    run_bot()

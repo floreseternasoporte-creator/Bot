@@ -33,8 +33,23 @@ Bot de Telegram que dobla videos y audios a múltiples idiomas **clonando la voz
 
 | Variable | Default | Descripción |
 |----------|---------|-------------|
-| `TELEGRAM_TOKEN` | ✅ Requerida | Token del bot |
-| `DATA_DIR` | `/app/data` | Ruta de la base de datos y archivos temporales |
+| `TELEGRAM_TOKEN` | ✅ Requerida | Token del bot. No se incluye un token por defecto para evitar conflictos entre despliegues. |
+| `BOT_MODE` | `auto` | `auto`, `webhook` o `polling`. En Railway, `auto` usa webhook si existe `RAILWAY_PUBLIC_DOMAIN`. |
+| `WEBHOOK_URL` | — | URL pública completa del webhook si no quieres depender de `RAILWAY_PUBLIC_DOMAIN`. |
+| `WEBHOOK_PATH` | `telegram-webhook` | Ruta pública del webhook cuando se construye desde `RAILWAY_PUBLIC_DOMAIN`. |
+| `WEBHOOK_SECRET_TOKEN` | — | Secreto opcional para validar llamadas entrantes del webhook de Telegram. |
+| `DATA_DIR` | `/app/data` | Ruta de la base de datos y archivos temporales. |
+
+
+### Evitar el error `409 Conflict` de Telegram
+
+Telegram solo permite **una** conexión `getUpdates` por token. Si ves:
+
+```
+Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+```
+
+significa que hay otra copia del bot usando el mismo `TELEGRAM_TOKEN` en polling. En Railway se recomienda dejar `BOT_MODE=auto` y usar un dominio público para que el bot arranque por webhook, evitando varias conexiones `getUpdates`. Si necesitas polling, asegúrate de tener una sola réplica/despliegue activo con ese token.
 
 ### Volumen persistente (recomendado)
 
