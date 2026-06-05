@@ -1,940 +1,220 @@
-"""
-Telegram Bot — Media Manager with native Telegram storage
-==========================================================
-• No external cloud required — files are stored on Telegram's servers (file_id)
-• Album system inspired by modern photo gallery apps
-• Built-in support system with email notifications
-• Runs continuously on Hugging Face Spaces or any server
-"""
 
 import os
-import sys
 import logging
-import sqlite3
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+import json
+import tempfile
 from pathlib import Path
+from moviepy.editor import VideoFileClip
+from googletrans import Translator
 
-log = logging.getLogger(__name__)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# ── Environment config ────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-_data_dir = os.environ.get("DATA_DIR", "/app/data")
-DB_PATH = os.path.join(_data_dir, "media.db")
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-SMTP_HOST     = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER     = os.environ.get("SMTP_USER", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-ADMIN_EMAIL   = os.environ.get("ADMIN_EMAIL", "")
+logger = logging.getLogger(__name__)
 
-# ── ConversationHandler states ────────────────────────────────────────────────
-(ASK_ALBUM_NAME, SUPPORT_DESCRIBE, SUPPORT_EMAIL) = range(3)
+# Environment variables
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-# ── SQLite database ───────────────────────────────────────────────────────────
-def init_db():
-    Path(_data_dir).mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.executescript("""
-        CREATE TABLE IF NOT EXISTS albums (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id  INTEGER NOT NULL,
-            name         TEXT NOT NULL,
-            created_at   TEXT NOT NULL,
-            cover_file_id TEXT
-        );
+if not TELEGRAM_TOKEN:
+    logger.error("TELEGRAM_TOKEN no está configurado en las variables de entorno.")
+    exit(1)
+if not OPENAI_API_KEY:
+    logger.error("OPENAI_API_KEY no está configurado en las variables de entorno.")
+    exit(1)
 
-        CREATE TABLE IF NOT EXISTS media (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id     INTEGER NOT NULL,
-            album_id        INTEGER,
-            file_id         TEXT NOT NULL,
-            file_unique_id  TEXT NOT NULL,
-            media_type      TEXT NOT NULL,
-            file_name       TEXT,
-            mime_type       TEXT,
-            size_bytes      INTEGER DEFAULT 0,
-            width           INTEGER,
-            height          INTEGER,
-            duration        INTEGER,
-            uploaded_at     TEXT NOT NULL,
-            FOREIGN KEY (album_id) REFERENCES albums(id) ON DELETE SET NULL
-        );
+# Initialize OpenAI client
+from openai import OpenAI
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-        CREATE TABLE IF NOT EXISTS support_tickets (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER NOT NULL,
-            username    TEXT,
-            email       TEXT NOT NULL,
-            issue       TEXT NOT NULL,
-            created_at  TEXT NOT NULL
-        );
-    """)
-    con.commit()
-    con.close()
-    log.info("Database initialized")
+# Supported languages for translation
+SUPPORTED_LANGUAGES = {
+    "es": "Español",
+    "en": "Inglés",
+    "fr": "Francés",
+    "de": "Alemán",
+    "it": "Italiano",
+    "pt": "Portugués",
+    "ru": "Ruso",
+    "zh": "Chino",
+    "ja": "Japonés",
+    "ar": "Árabe",
+}
 
-# ── Queries ───────────────────────────────────────────────────────────────────
-def get_albums(telegram_id: int):
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    rows = con.execute(
-        "SELECT a.*, COUNT(m.id) as total FROM albums a "
-        "LEFT JOIN media m ON m.album_id = a.id "
-        "WHERE a.telegram_id=? GROUP BY a.id ORDER BY a.created_at DESC",
-        (telegram_id,)
-    ).fetchall()
-    con.close()
-    return [dict(r) for r in rows]
+# States for conversation handler
+SELECT_LANGUAGE = 0
 
-def get_album(album_id: int, telegram_id: int):
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    row = con.execute(
-        "SELECT * FROM albums WHERE id=? AND telegram_id=?",
-        (album_id, telegram_id)
-    ).fetchone()
-    con.close()
-    return dict(row) if row else None
-
-def create_album(telegram_id: int, name: str) -> int:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.execute(
-        "INSERT INTO albums (telegram_id, name, created_at) VALUES (?,?,?)",
-        (telegram_id, name, datetime.utcnow().isoformat())
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a welcome message when the command /start is issued."""
+    await update.message.reply_text(
+        "¡Hola! Soy un bot que genera subtítulos para tus videos.\n\n"
+        "Simplemente envíame un video y te preguntaré en qué idioma(s) quieres los subtítulos."
     )
-    album_id = cur.lastrowid
-    con.commit(); con.close()
-    return album_id
 
-def delete_album(album_id: int, telegram_id: int):
-    con = sqlite3.connect(DB_PATH)
-    con.execute("UPDATE media SET album_id=NULL WHERE album_id=? AND telegram_id=?",
-                (album_id, telegram_id))
-    con.execute("DELETE FROM albums WHERE id=? AND telegram_id=?",
-                (album_id, telegram_id))
-    con.commit(); con.close()
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles video messages: downloads the video and asks for subtitle languages."""
+    user = update.effective_user
+    logger.info(f"Video recibido de {user.full_name} ({user.id})")
 
-def add_media(telegram_id, album_id, file_id, file_unique_id, media_type,
-              file_name, mime_type, size_bytes, width=None, height=None, duration=None):
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "INSERT INTO media (telegram_id,album_id,file_id,file_unique_id,media_type,"
-        "file_name,mime_type,size_bytes,width,height,duration,uploaded_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (telegram_id, album_id, file_id, file_unique_id, media_type,
-         file_name, mime_type, size_bytes, width, height, duration,
-         datetime.utcnow().isoformat())
+    video_file = update.message.video
+    if not video_file:
+        await update.message.reply_text("Por favor, envía un video válido.")
+        return
+
+    # Store file_id in user_data for later use
+    context.user_data["video_file_id"] = video_file.file_id
+    context.user_data["video_mime_type"] = video_file.mime_type
+
+    keyboard = []
+    for lang_code, lang_name in SUPPORTED_LANGUAGES.items():
+        keyboard.append([InlineKeyboardButton(lang_name, callback_data=f"lang_{lang_code}")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "He recibido tu video. Ahora, por favor, selecciona el idioma o los idiomas en los que deseas los subtítulos.\n\n" 
+        "Puedes seleccionar varios idiomas uno por uno.",
+        reply_markup=reply_markup
     )
-    if album_id:
-        con.execute(
-            "UPDATE albums SET cover_file_id=? WHERE id=? AND cover_file_id IS NULL",
-            (file_id, album_id)
-        )
-    con.commit(); con.close()
+    return SELECT_LANGUAGE
 
-def get_media(telegram_id: int, album_id=None, media_type=None, limit=20, offset=0):
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    conds = ["telegram_id=?"]
-    params = [telegram_id]
-    if album_id == "none":
-        conds.append("album_id IS NULL")
-    elif album_id is not None:
-        conds.append("album_id=?"); params.append(album_id)
-    if media_type:
-        conds.append("media_type=?"); params.append(media_type)
-    where = " AND ".join(conds)
-    rows = con.execute(
-        f"SELECT * FROM media WHERE {where} ORDER BY uploaded_at DESC LIMIT ? OFFSET ?",
-        (*params, limit, offset)
-    ).fetchall()
-    con.close()
-    return [dict(r) for r in rows]
+async def select_language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles language selection from inline keyboard."""
+    query = update.callback_query
+    await query.answer()
 
-def count_media(telegram_id: int, album_id=None, media_type=None):
-    con = sqlite3.connect(DB_PATH)
-    conds = ["telegram_id=?"]
-    params = [telegram_id]
-    if album_id == "none":
-        conds.append("album_id IS NULL")
-    elif album_id is not None:
-        conds.append("album_id=?"); params.append(album_id)
-    if media_type:
-        conds.append("media_type=?"); params.append(media_type)
-    where = " AND ".join(conds)
-    count = con.execute(f"SELECT COUNT(*) FROM media WHERE {where}", params).fetchone()[0]
-    con.close()
-    return count
+    lang_code = query.data.split("_")[1]
+    lang_name = SUPPORTED_LANGUAGES.get(lang_code)
 
-def get_stats(telegram_id: int):
-    con = sqlite3.connect(DB_PATH)
-    row = con.execute(
-        "SELECT "
-        "COUNT(*) as total, "
-        "SUM(CASE WHEN media_type='photo' THEN 1 ELSE 0 END) as photos, "
-        "SUM(CASE WHEN media_type='video' THEN 1 ELSE 0 END) as videos, "
-        "SUM(CASE WHEN media_type='document' THEN 1 ELSE 0 END) as docs, "
-        "SUM(CASE WHEN media_type='audio' THEN 1 ELSE 0 END) as audios, "
-        "SUM(size_bytes) as total_size "
-        "FROM media WHERE telegram_id=?",
-        (telegram_id,)
-    ).fetchone()
-    albums = con.execute(
-        "SELECT COUNT(*) FROM albums WHERE telegram_id=?", (telegram_id,)
-    ).fetchone()[0]
-    con.close()
-    return {
-        "total": row[0] or 0, "photos": row[1] or 0, "videos": row[2] or 0,
-        "docs": row[3] or 0, "audios": row[4] or 0,
-        "total_size": row[5] or 0, "albums": albums
-    }
+    if "selected_languages" not in context.user_data:
+        context.user_data["selected_languages"] = []
+    
+    if lang_code not in context.user_data["selected_languages"]:
+        context.user_data["selected_languages"].append(lang_code)
+        await query.edit_message_text(text=f"Has seleccionado: {lang_name}. Puedes seleccionar más o enviar /done cuando hayas terminado.")
+    else:
+        await query.edit_message_text(text=f"Ya habías seleccionado: {lang_name}. Puedes seleccionar más o enviar /done cuando hayas terminado.")
+    
+    return SELECT_LANGUAGE
 
-def delete_media(media_id: int, telegram_id: int):
-    con = sqlite3.connect(DB_PATH)
-    con.execute("DELETE FROM media WHERE id=? AND telegram_id=?", (media_id, telegram_id))
-    con.commit(); con.close()
+async def done_selecting_languages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Processes the selected languages and starts transcription/translation."""
+    user = update.effective_user
+    selected_languages = context.user_data.get("selected_languages", [])
+    video_file_id = context.user_data.get("video_file_id")
+    video_mime_type = context.user_data.get("video_mime_type")
 
-def move_to_album(file_unique_id: str, telegram_id: int, album_id):
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "UPDATE media SET album_id=? WHERE file_unique_id=? AND telegram_id=?",
-        (album_id, file_unique_id, telegram_id)
-    )
-    con.commit(); con.close()
+    if not video_file_id or not selected_languages:
+        await update.message.reply_text("Parece que no se ha subido ningún video o no se han seleccionado idiomas. Por favor, envía un video y selecciona los idiomas.")
+        return
 
-def save_ticket(telegram_id: int, username: str, email: str, issue: str):
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "INSERT INTO support_tickets (telegram_id, username, email, issue, created_at) "
-        "VALUES (?,?,?,?,?)",
-        (telegram_id, username, email, issue, datetime.utcnow().isoformat())
-    )
-    con.commit(); con.close()
+    await update.message.reply_text(f"¡Entendido! Generando subtítulos en {', '.join([SUPPORTED_LANGUAGES[lang] for lang in selected_languages])}. Esto puede tardar un poco...")
 
-# ── Email ─────────────────────────────────────────────────────────────────────
-def send_email(to: str, subject: str, body: str, reply_to: str = None) -> bool:
-    if not SMTP_USER or not SMTP_PASSWORD:
-        log.warning("SMTP credentials not configured — email not sent")
-        return False
     try:
-        msg = MIMEMultipart()
-        msg["From"]    = SMTP_USER
-        msg["To"]      = to
-        msg["Subject"] = subject
-        if reply_to:
-            msg["Reply-To"] = reply_to
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
-        log.info(f"Email sent to {to}")
-        return True
+        # Download the video
+        new_file = await context.bot.get_file(video_file_id)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / f"{video_file_id}.mp4"
+            await new_file.download_to_drive(video_path)
+            logger.info(f"Video descargado a {video_path}")
+
+            # Extract audio
+            audio_path = Path(tmpdir) / f"{video_file_id}.mp3"
+            clip = VideoFileClip(str(video_path))
+            clip.audio.write_audiofile(str(audio_path))
+            clip.close()
+            logger.info(f"Audio extraído a {audio_path}")
+
+            # Transcribe audio using Whisper
+            await update.message.reply_text("Transcribiendo audio con Whisper...")
+            with open(audio_path, "rb") as audio_file:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1", 
+                    file=audio_file, 
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"]
+                )
+            logger.info("Transcripción completada.")
+            
+            # Generate SRT for each selected language
+            translator = Translator()
+            for lang_code in selected_languages:
+                srt_content = ""
+                for segment in transcript.segments:
+                    start_time = segment['start']
+                    end_time = segment['end']
+                    text = segment['text'].strip()
+
+                    # Translate if not the original language (Whisper transcribes to English by default if not specified)
+                    # Assuming Whisper's default output is English for simplicity, or detecting if it's different
+                    # For a more robust solution, detect source language of transcript first
+                    translated_text = text
+                    if lang_code != "en": # Assuming English is the default transcription language
+                        await update.message.reply_text(f"Traduciendo a {SUPPORTED_LANGUAGES[lang_code]}...")
+                        translated_obj = translator.translate(text, dest=lang_code)
+                        translated_text = translated_obj.text
+
+                    srt_content += f"{segment['id'] + 1}\n"
+                    srt_content += f"{format_timestamp(start_time)} --> {format_timestamp(end_time)}\n"
+                    srt_content += f"{translated_text}\n\n"
+                
+                srt_filename = f"subtitles_{lang_code}.srt"
+                srt_path = Path(tmpdir) / srt_filename
+                with open(srt_path, "w", encoding="utf-8") as f:
+                    f.write(srt_content)
+                
+                await update.message.reply_document(document=srt_path, caption=f"Subtítulos en {SUPPORTED_LANGUAGES[lang_code]}")
+                logger.info(f"Subtítulos en {lang_name} enviados.")
+
     except Exception as e:
-        log.error(f"Failed to send email to {to}: {e}")
-        return False
+        logger.error(f"Error al procesar el video: {e}", exc_info=True)
+        await update.message.reply_text(f"Ocurrió un error al procesar tu video: {e}")
+    finally:
+        # Clear user data for the next video
+        if "video_file_id" in context.user_data:
+            del context.user_data["video_file_id"]
+        if "selected_languages" in context.user_data:
+            del context.user_data["selected_languages"]
+        if "video_mime_type" in context.user_data:
+            del context.user_data["video_mime_type"]
 
-def validate_email_address(email_str: str):
-    """Returns normalized email string or None if invalid."""
-    try:
-        from email_validator import validate_email, EmailNotValidError
-        result = validate_email(email_str, check_deliverability=False)
-        return result.email
-    except Exception:
-        return None
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def fmt_size(b: int) -> str:
-    if b < 1024: return f"{b} B"
-    if b < 1024**2: return f"{b//1024} KB"
-    return f"{b//1024**2} MB"
+def format_timestamp(seconds: float) -> str:
+    """Formats seconds into SRT time format (HH:MM:SS,ms)."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    milliseconds = int((seconds - int(seconds)) * 1000)
+    return f"{hours:02}:{minutes:02}:{secs:02},{milliseconds:03}"
 
-def fmt_date(iso: str) -> str:
-    try:
-        return datetime.fromisoformat(iso).strftime("%b %d, %Y · %H:%M")
-    except Exception:
-        return iso[:16]
-
-PAGE_SIZE = 10
-
-# ── /start ────────────────────────────────────────────────────────────────────
-async def cmd_start(update, ctx):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    kb = [
-        [InlineKeyboardButton("📸 Photos",    callback_data="browse:photo:0"),
-         InlineKeyboardButton("🎬 Videos",    callback_data="browse:video:0")],
-        [InlineKeyboardButton("🗂 Albums",    callback_data="albums_menu"),
-         InlineKeyboardButton("📊 Insights",  callback_data="stats")],
-        [InlineKeyboardButton("🆘 Support",   callback_data="help")],
-    ]
-    await update.message.reply_text(
-        "📱 *Welcome to your personal gallery*\n\n"
-        "Send me photos, videos, audio, or documents and I'll keep them organized.\n"
-        "Create albums to group your content — everything is stored securely on Telegram.\n\n"
-        "What would you like to do?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-# ── Support flow (/help) ──────────────────────────────────────────────────────
-async def cmd_help_start(update, ctx):
-    await update.message.reply_text(
-        "🆘 *Support*\n\n"
-        "We're here to help. Please describe your issue below and we'll follow up with you by email.\n\n"
-        "What's going on?",
-        parse_mode="Markdown"
-    )
-    return SUPPORT_DESCRIBE
-
-async def cb_help_start(update, ctx):
-    await update.callback_query.answer()
-    await update.callback_query.message.reply_text(
-        "🆘 *Support*\n\n"
-        "We're here to help. Please describe your issue below and we'll follow up with you by email.\n\n"
-        "What's going on?",
-        parse_mode="Markdown"
-    )
-    return SUPPORT_DESCRIBE
-
-async def recv_support_issue(update, ctx):
-    issue = update.message.text.strip()
-    if not issue:
-        await update.message.reply_text("Please describe your issue so we can help you:")
-        return SUPPORT_DESCRIBE
-    ctx.user_data["support_issue"] = issue
-    await update.message.reply_text(
-        "Got it. What's your email address?\n\n"
-        "We'll send you a confirmation and follow up there."
-    )
-    return SUPPORT_EMAIL
-
-async def recv_support_email(update, ctx):
-    from telegram.ext import ConversationHandler
-    email_str = update.message.text.strip()
-
-    email = validate_email_address(email_str)
-    if not email:
-        await update.message.reply_text(
-            "That doesn't look like a valid email address. Please try again:"
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and send a telegram message to notify the user."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "¡Ups! Ha ocurrido un error. Por favor, inténtalo de nuevo más tarde."
         )
-        return SUPPORT_EMAIL
 
-    issue    = ctx.user_data.pop("support_issue", "No description provided")
-    user     = update.effective_user
-    tid      = user.id
-    username = f"@{user.username}" if user.username else f"User #{tid}"
-
-    save_ticket(tid, username, email, issue)
-
-    user_subject = "We received your support request"
-    user_body = (
-        f"Hi,\n\n"
-        f"Thank you for reaching out. We've received your request and our team will get back to you shortly.\n\n"
-        f"──────────────────────\n"
-        f"Your message:\n\n"
-        f"{issue}\n"
-        f"──────────────────────\n\n"
-        f"If you have additional details to share, simply reply to this email.\n\n"
-        f"Best regards,\n"
-        f"The Support Team"
-    )
-
-    admin_subject = f"[Support] New request from {username}"
-    admin_body = (
-        f"A new support request was submitted via Telegram.\n\n"
-        f"──────────────────────\n"
-        f"From:      {username}\n"
-        f"Telegram:  {tid}\n"
-        f"Email:     {email}\n"
-        f"Date:      {fmt_date(datetime.utcnow().isoformat())}\n"
-        f"──────────────────────\n\n"
-        f"Issue:\n\n"
-        f"{issue}\n\n"
-        f"──────────────────────\n"
-        f"Reply to this email to respond directly to the user."
-    )
-
-    user_sent = send_email(email, user_subject, user_body)
-    if ADMIN_EMAIL:
-        send_email(ADMIN_EMAIL, admin_subject, admin_body, reply_to=email)
-
-    ctx.user_data.clear()
-
-    if user_sent:
-        await update.message.reply_text(
-            "✅ *Support request received*\n\n"
-            f"A confirmation has been sent to *{email}*.\n"
-            "Our team will get back to you as soon as possible.",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            "✅ *Support request received*\n\n"
-            "Our team has been notified and will reach out to you.\n\n"
-            "_(Email delivery is currently unavailable — your request is saved.)_",
-            parse_mode="Markdown"
-        )
-    return ConversationHandler.END
-
-# ── Receive media ─────────────────────────────────────────────────────────────
-async def _save_media(update, ctx, media_type: str):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    tid = update.effective_user.id
-    msg = update.message
-
-    if media_type == "photo":
-        obj = msg.photo[-1]
-        file_id, file_unique_id = obj.file_id, obj.file_unique_id
-        width, height = obj.width, obj.height
-        size_bytes = obj.file_size or 0
-        file_name, mime_type, duration = "photo.jpg", "image/jpeg", None
-
-    elif media_type == "video":
-        obj = msg.video
-        file_id, file_unique_id = obj.file_id, obj.file_unique_id
-        width, height, duration = obj.width, obj.height, obj.duration
-        size_bytes = obj.file_size or 0
-        file_name = obj.file_name or "video.mp4"
-        mime_type = obj.mime_type or "video/mp4"
-
-    elif media_type == "audio":
-        obj = msg.audio or msg.voice
-        file_id, file_unique_id = obj.file_id, obj.file_unique_id
-        width, height, duration = None, None, obj.duration
-        size_bytes = obj.file_size or 0
-        file_name = getattr(obj, "file_name", None) or "audio.ogg"
-        mime_type = getattr(obj, "mime_type", None) or "audio/ogg"
-
-    else:
-        obj = msg.document
-        file_id, file_unique_id = obj.file_id, obj.file_unique_id
-        width, height, duration = None, None, None
-        size_bytes = obj.file_size or 0
-        file_name = obj.file_name or "file"
-        mime_type = obj.mime_type or "application/octet-stream"
-
-    add_media(tid, None, file_id, file_unique_id, media_type,
-              file_name, mime_type, size_bytes, width, height, duration)
-
-    ctx.user_data["last_file_unique_id"] = file_unique_id
-    ctx.user_data["last_media_type"] = media_type
-
-    albums = get_albums(tid)
-    kb = []
-    row = []
-    for a in albums[:6]:
-        row.append(InlineKeyboardButton(
-            f"🗂 {a['name']} ({a['total']})",
-            callback_data=f"assign:{file_unique_id}:{a['id']}"
-        ))
-        if len(row) == 2:
-            kb.append(row); row = []
-    if row:
-        kb.append(row)
-    kb.append([
-        InlineKeyboardButton("📁 No album",  callback_data=f"assign:{file_unique_id}:none"),
-        InlineKeyboardButton("➕ New album", callback_data=f"newalbum:{file_unique_id}")
-    ])
-
-    ICONS = {"photo": "🖼", "video": "🎬", "audio": "🎵", "document": "📄"}
-    icon = ICONS.get(media_type, "📁")
-
-    await msg.reply_text(
-        f"{icon} *{file_name}* saved\n"
-        f"📏 {fmt_size(size_bytes)}\n\n"
-        "Which album should this go into?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-async def handle_photo(update, ctx):    await _save_media(update, ctx, "photo")
-async def handle_video(update, ctx):    await _save_media(update, ctx, "video")
-async def handle_audio(update, ctx):    await _save_media(update, ctx, "audio")
-async def handle_document(update, ctx): await _save_media(update, ctx, "document")
-
-# ── Assign to album ───────────────────────────────────────────────────────────
-async def cb_assign_album(update, ctx):
-    await update.callback_query.answer()
-    tid = update.effective_user.id
-    _, file_unique_id, album_raw = update.callback_query.data.split(":", 2)
-    album_id = None if album_raw == "none" else int(album_raw)
-    move_to_album(file_unique_id, tid, album_id)
-
-    if album_id:
-        album = get_album(album_id, tid)
-        name = album["name"] if album else "album"
-        text = f"✅ Added to *{name}*"
-    else:
-        text = "✅ Saved without an album"
-
-    await update.callback_query.message.edit_text(text, parse_mode="Markdown")
-
-# ── Create album from media ───────────────────────────────────────────────────
-async def cb_newalbum_for_file(update, ctx):
-    await update.callback_query.answer()
-    _, file_unique_id = update.callback_query.data.split(":", 1)
-    ctx.user_data["pending_file_for_album"] = file_unique_id
-    await update.callback_query.message.reply_text(
-        "📝 What would you like to name this album?"
-    )
-    return ASK_ALBUM_NAME
-
-async def recv_album_name(update, ctx):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    from telegram.ext import ConversationHandler
-    tid = update.effective_user.id
-    name = update.message.text.strip()
-    if not name:
-        await update.message.reply_text("Album name can't be empty. Please try again:")
-        return ASK_ALBUM_NAME
-    album_id = create_album(tid, name)
-    file_unique_id = ctx.user_data.pop("pending_file_for_album", None)
-    if file_unique_id:
-        move_to_album(file_unique_id, tid, album_id)
-    ctx.user_data.clear()
-    kb = [[InlineKeyboardButton(f"📂 Open {name}", callback_data=f"album:{album_id}:0")]]
-    await update.message.reply_text(
-        f"✅ Album *{name}* created and file added.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-    return ConversationHandler.END
-
-async def cancel_conv(update, ctx):
-    from telegram.ext import ConversationHandler
-    ctx.user_data.clear()
-    await update.message.reply_text("Cancelled.")
-    return ConversationHandler.END
-
-# ── /new_album ────────────────────────────────────────────────────────────────
-async def cmd_new_album(update, ctx):
-    ctx.user_data["pending_file_for_album"] = None
-    await update.message.reply_text("📝 What would you like to name this album?")
-    return ASK_ALBUM_NAME
-
-# ── /albums ───────────────────────────────────────────────────────────────────
-async def cmd_albums(update, ctx):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    tid = update.effective_user.id
-    albums = get_albums(tid)
-    if not albums:
-        kb = [[InlineKeyboardButton("➕ Create album", callback_data="create_album_menu")]]
-        await update.message.reply_text(
-            "You don't have any albums yet. Create your first one.",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
-        return
-    kb = []
-    for a in albums:
-        kb.append([InlineKeyboardButton(
-            f"🗂 {a['name']} · {a['total']} files",
-            callback_data=f"album:{a['id']}:0"
-        )])
-    kb.append([
-        InlineKeyboardButton("➕ New album", callback_data="create_album_menu"),
-        InlineKeyboardButton("🏠 Home",       callback_data="main_menu")
-    ])
-    await update.message.reply_text(
-        f"🗂 *Your Albums* ({len(albums)})\n\nSelect an album to view its contents:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-async def cb_albums_menu(update, ctx):
-    await update.callback_query.answer()
-    tid = update.effective_user.id
-    albums = get_albums(tid)
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    if not albums:
-        kb = [[InlineKeyboardButton("➕ Create album", callback_data="create_album_menu"),
-               InlineKeyboardButton("🏠 Home",          callback_data="main_menu")]]
-        await update.callback_query.message.edit_text(
-            "You don't have any albums yet. Create your first one.",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
-        return
-    kb = []
-    for a in albums:
-        kb.append([InlineKeyboardButton(
-            f"🗂 {a['name']} · {a['total']} files",
-            callback_data=f"album:{a['id']}:0"
-        )])
-    kb.append([
-        InlineKeyboardButton("➕ New album", callback_data="create_album_menu"),
-        InlineKeyboardButton("🏠 Home",       callback_data="main_menu")
-    ])
-    await update.callback_query.message.edit_text(
-        f"🗂 *Your Albums* ({len(albums)})\n\nSelect an album to view its contents:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-async def cb_create_album_menu(update, ctx):
-    await update.callback_query.answer()
-    ctx.user_data["pending_file_for_album"] = None
-    await update.callback_query.message.reply_text(
-        "📝 What would you like to name this album?\n\nType a name below:"
-    )
-    return ASK_ALBUM_NAME
-
-# ── View album ────────────────────────────────────────────────────────────────
-async def cb_album_view(update, ctx):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    await update.callback_query.answer()
-    tid = update.effective_user.id
-    parts = update.callback_query.data.split(":")
-    album_id, page = int(parts[1]), int(parts[2])
-    album = get_album(album_id, tid)
-    if not album:
-        await update.callback_query.message.edit_text("Album not found.")
-        return
-
-    offset = page * PAGE_SIZE
-    items = get_media(tid, album_id=album_id, limit=PAGE_SIZE, offset=offset)
-    total = count_media(tid, album_id=album_id)
-
-    if not items:
-        kb = [[InlineKeyboardButton("🗂 My Albums",    callback_data="albums_menu"),
-               InlineKeyboardButton("🗑 Delete album", callback_data=f"del_album:{album_id}")]]
-        await update.callback_query.message.edit_text(
-            f"📂 *{album['name']}*\n\nThis album is empty.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
-        return
-
-    pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-    header = (
-        f"📂 *{album['name']}*\n"
-        f"📅 Created: {fmt_date(album['created_at'])}\n"
-        f"📦 {total} files · Page {page+1} of {pages}\n\n"
-    )
-    ICONS = {"photo": "🖼", "video": "🎬", "audio": "🎵", "document": "📄"}
-    lines = []
-    for it in items:
-        icon = ICONS.get(it["media_type"], "📁")
-        lines.append(f"{icon} `{it['file_name'] or it['media_type']}` · {fmt_date(it['uploaded_at'])}")
-    text = header + "\n".join(lines)
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀ Previous", callback_data=f"album:{album_id}:{page-1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton("Next ▶",     callback_data=f"album:{album_id}:{page+1}"))
-
-    kb = []
-    if nav: kb.append(nav)
-    kb.append([
-        InlineKeyboardButton("📤 View files",   callback_data=f"send_album:{album_id}:{page}"),
-        InlineKeyboardButton("🗑 Delete album", callback_data=f"del_album:{album_id}")
-    ])
-    kb.append([
-        InlineKeyboardButton("🗂 My Albums", callback_data="albums_menu"),
-        InlineKeyboardButton("🏠 Home",       callback_data="main_menu")
-    ])
-    await update.callback_query.message.edit_text(
-        text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-async def cb_send_album(update, ctx):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    await update.callback_query.answer("Sending files…")
-    tid = update.effective_user.id
-    parts = update.callback_query.data.split(":")
-    album_id, page = int(parts[1]), int(parts[2])
-    album = get_album(album_id, tid)
-    if not album:
-        return
-    offset = page * PAGE_SIZE
-    items = get_media(tid, album_id=album_id, limit=PAGE_SIZE, offset=offset)
-    chat_id = update.effective_chat.id
-    for it in items:
-        caption = f"📂 {album['name']} · {fmt_date(it['uploaded_at'])}"
-        try:
-            if it["media_type"] == "photo":
-                await ctx.bot.send_photo(chat_id, it["file_id"], caption=caption)
-            elif it["media_type"] == "video":
-                await ctx.bot.send_video(chat_id, it["file_id"], caption=caption)
-            elif it["media_type"] == "audio":
-                await ctx.bot.send_audio(chat_id, it["file_id"], caption=caption)
-            else:
-                await ctx.bot.send_document(chat_id, it["file_id"], caption=caption)
-        except Exception as e:
-            log.warning(f"Could not forward {it['file_id']}: {e}")
-
-# ── Delete album ──────────────────────────────────────────────────────────────
-async def cb_delete_album(update, ctx):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    await update.callback_query.answer()
-    album_id = int(update.callback_query.data.split(":")[1])
-    tid = update.effective_user.id
-    album = get_album(album_id, tid)
-    if not album:
-        await update.callback_query.message.edit_text("Album not found.")
-        return
-    kb = [[
-        InlineKeyboardButton("✅ Yes, delete", callback_data=f"confirm_del_album:{album_id}"),
-        InlineKeyboardButton("❌ Cancel",       callback_data=f"album:{album_id}:0")
-    ]]
-    await update.callback_query.message.edit_text(
-        f"⚠️ Delete album *{album['name']}*?\n\n"
-        "Your files won't be deleted — they'll just be removed from this album.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-async def cb_confirm_delete_album(update, ctx):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    await update.callback_query.answer()
-    album_id = int(update.callback_query.data.split(":")[1])
-    tid = update.effective_user.id
-    album = get_album(album_id, tid)
-    name = album["name"] if album else "album"
-    delete_album(album_id, tid)
-    kb = [[InlineKeyboardButton("🗂 My Albums", callback_data="albums_menu")]]
-    await update.callback_query.message.edit_text(
-        f"🗑 *{name}* has been deleted.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-# ── /gallery ──────────────────────────────────────────────────────────────────
-async def cmd_gallery(update, ctx):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    kb = [
-        [InlineKeyboardButton("🖼 Photos",    callback_data="browse:photo:0"),
-         InlineKeyboardButton("🎬 Videos",    callback_data="browse:video:0")],
-        [InlineKeyboardButton("🎵 Audio",     callback_data="browse:audio:0"),
-         InlineKeyboardButton("📄 Documents", callback_data="browse:document:0")],
-        [InlineKeyboardButton("📦 All",       callback_data="browse:all:0"),
-         InlineKeyboardButton("🗂 Albums",    callback_data="albums_menu")],
-    ]
-    await update.message.reply_text(
-        "🖼 *Your Gallery*\n\nWhat would you like to explore?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-async def cb_browse(update, ctx):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    await update.callback_query.answer()
-    tid = update.effective_user.id
-    _, mtype, pg = update.callback_query.data.split(":")
-    page = int(pg)
-    mt = None if mtype == "all" else mtype
-    offset = page * PAGE_SIZE
-    items = get_media(tid, media_type=mt, limit=PAGE_SIZE, offset=offset)
-    total = count_media(tid, media_type=mt)
-
-    LABELS = {"photo": "Photos 🖼", "video": "Videos 🎬",
-              "audio": "Audio 🎵", "document": "Documents 📄", "all": "All 📦"}
-    label = LABELS.get(mtype, "Files")
-    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-
-    if not items:
-        await update.callback_query.message.edit_text(
-            f"No {label.lower()} yet.\nSend me some files and they'll show up here."
-        )
-        return
-
-    ICONS = {"photo": "🖼", "video": "🎬", "audio": "🎵", "document": "📄"}
-    lines = [f"*{label}* — {total} files · Page {page+1} of {pages}\n"]
-    for it in items:
-        icon = ICONS.get(it["media_type"], "📁")
-        lines.append(
-            f"{icon} `{it['file_name'] or it['media_type']}`\n"
-            f"   📅 {fmt_date(it['uploaded_at'])} · {fmt_size(it['size_bytes'])}"
-        )
-    text = "\n".join(lines)
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀ Previous", callback_data=f"browse:{mtype}:{page-1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton("Next ▶",     callback_data=f"browse:{mtype}:{page+1}"))
-
-    kb = []
-    if nav: kb.append(nav)
-    kb.append([
-        InlineKeyboardButton("📤 Send this page", callback_data=f"send_browse:{mtype}:{page}"),
-        InlineKeyboardButton("🏠 Home",            callback_data="main_menu")
-    ])
-    await update.callback_query.message.edit_text(
-        text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-async def cb_send_browse(update, ctx):
-    await update.callback_query.answer("Sending…")
-    tid = update.effective_user.id
-    _, mtype, pg = update.callback_query.data.split(":")
-    page = int(pg)
-    mt = None if mtype == "all" else mtype
-    offset = page * PAGE_SIZE
-    items = get_media(tid, media_type=mt, limit=PAGE_SIZE, offset=offset)
-    chat_id = update.effective_chat.id
-    for it in items:
-        caption = f"{fmt_date(it['uploaded_at'])} · {fmt_size(it['size_bytes'])}"
-        try:
-            if it["media_type"] == "photo":
-                await ctx.bot.send_photo(chat_id, it["file_id"], caption=caption)
-            elif it["media_type"] == "video":
-                await ctx.bot.send_video(chat_id, it["file_id"], caption=caption)
-            elif it["media_type"] == "audio":
-                await ctx.bot.send_audio(chat_id, it["file_id"], caption=caption)
-            else:
-                await ctx.bot.send_document(chat_id, it["file_id"], caption=caption)
-        except Exception as e:
-            log.warning(f"Could not forward {it['file_id']}: {e}")
-
-# ── Statistics ────────────────────────────────────────────────────────────────
-async def cmd_stats(update, ctx):
-    tid = update.effective_user.id
-    s = get_stats(tid)
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    kb = [[InlineKeyboardButton("🏠 Home", callback_data="main_menu")]]
-    text = (
-        "📊 *Your Insights*\n\n"
-        f"🖼 Photos:        {s['photos']}\n"
-        f"🎬 Videos:        {s['videos']}\n"
-        f"🎵 Audio:         {s['audios']}\n"
-        f"📄 Documents:     {s['docs']}\n"
-        f"📦 Total files:   {s['total']}\n"
-        f"🗂 Albums:        {s['albums']}\n"
-        f"💾 Storage used:  {fmt_size(s['total_size'])}\n\n"
-        "_All files are stored securely on Telegram's servers_"
-    )
-    if update.message:
-        await update.message.reply_text(text, parse_mode="Markdown",
-                                         reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        await update.callback_query.message.edit_text(text, parse_mode="Markdown",
-                                                       reply_markup=InlineKeyboardMarkup(kb))
-
-async def cb_stats(update, ctx):
-    await update.callback_query.answer()
-    await cmd_stats(update, ctx)
-
-# ── Main menu ─────────────────────────────────────────────────────────────────
-async def cb_main_menu(update, ctx):
-    await update.callback_query.answer()
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    kb = [
-        [InlineKeyboardButton("📸 Photos",   callback_data="browse:photo:0"),
-         InlineKeyboardButton("🎬 Videos",   callback_data="browse:video:0")],
-        [InlineKeyboardButton("🗂 Albums",   callback_data="albums_menu"),
-         InlineKeyboardButton("📊 Insights", callback_data="stats")],
-        [InlineKeyboardButton("🆘 Support",  callback_data="help")],
-    ]
-    await update.callback_query.message.edit_text(
-        "📱 *Home*\n\nSend me a file or choose an option below:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-def _build_app():
-    from telegram.ext import (
-        Application, CommandHandler, MessageHandler,
-        CallbackQueryHandler, ConversationHandler, filters
-    )
-
-    if not TELEGRAM_TOKEN:
-        log.error("TELEGRAM_TOKEN is not set. Add the environment variable and restart.")
-        sys.exit(1)
-
+def main() -> None:
+    """Start the bot."""
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # ── Support conversation ──
-    support_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("help",        cmd_help_start),
-            CallbackQueryHandler(cb_help_start, pattern="^help$"),
-        ],
-        states={
-            SUPPORT_DESCRIBE: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_support_issue)],
-            SUPPORT_EMAIL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_support_email)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conv)],
-        per_message=False,
-        per_chat=True,
-    )
+    # Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video))
+    application.add_handler(CallbackQueryHandler(select_language_callback, pattern="^lang_"))
+    application.add_handler(CommandHandler("done", done_selecting_languages))
 
-    # ── Album creation conversation ──
-    album_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("new_album", cmd_new_album),
-            CallbackQueryHandler(cb_newalbum_for_file, pattern=r"^newalbum:"),
-            CallbackQueryHandler(cb_create_album_menu, pattern="^create_album_menu$"),
-        ],
-        states={
-            ASK_ALBUM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_album_name)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conv)],
-        per_message=False,
-        per_chat=True,
-    )
+    # Error handler
+    application.add_error_handler(error_handler)
 
-    application.add_handler(support_conv)
-    application.add_handler(album_conv)
-
-    # Commands
-    application.add_handler(CommandHandler("start",   cmd_start))
-    application.add_handler(CommandHandler("gallery", cmd_gallery))
-    application.add_handler(CommandHandler("albums",  cmd_albums))
-    application.add_handler(CommandHandler("stats",   cmd_stats))
-
-    # Callbacks
-    application.add_handler(CallbackQueryHandler(cb_main_menu,            pattern="^main_menu$"))
-    application.add_handler(CallbackQueryHandler(cb_stats,                pattern="^stats$"))
-    application.add_handler(CallbackQueryHandler(cb_albums_menu,          pattern="^albums_menu$"))
-    application.add_handler(CallbackQueryHandler(cb_album_view,           pattern=r"^album:\d+:\d+$"))
-    application.add_handler(CallbackQueryHandler(cb_send_album,           pattern=r"^send_album:\d+:\d+$"))
-    application.add_handler(CallbackQueryHandler(cb_delete_album,         pattern=r"^del_album:\d+$"))
-    application.add_handler(CallbackQueryHandler(cb_confirm_delete_album, pattern=r"^confirm_del_album:\d+$"))
-    application.add_handler(CallbackQueryHandler(cb_assign_album,         pattern=r"^assign:"))
-    application.add_handler(CallbackQueryHandler(cb_browse,               pattern=r"^browse:"))
-    application.add_handler(CallbackQueryHandler(cb_send_browse,          pattern=r"^send_browse:"))
-
-    # Media handlers
-    application.add_handler(MessageHandler(filters.PHOTO,                    handle_photo))
-    application.add_handler(MessageHandler(filters.VIDEO,                    handle_video))
-    application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE,    handle_audio))
-    application.add_handler(MessageHandler(filters.Document.ALL,             handle_document))
-
-    return application
-
-
-async def main_async():
-    application = _build_app()
-    log.info("Bot started with polling")
-    async with application:
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(drop_pending_updates=True)
-        import asyncio as _asyncio
-        stop_event = _asyncio.Event()
-        await stop_event.wait()
-
+    # Run the bot until the user presses Ctrl-C
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    import asyncio as _asyncio
-    logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-
-    if not TELEGRAM_TOKEN:
-        log.error(
-            "\n\n"
-            "  ╔══════════════════════════════════════════════════════╗\n"
-            "  ║  TELEGRAM_TOKEN is not configured                    ║\n"
-            "  ║  Add the environment variable to your deployment:    ║\n"
-            "  ║  Settings → Variables → TELEGRAM_TOKEN = your_token ║\n"
-            "  ╚══════════════════════════════════════════════════════╝\n"
-        )
-        sys.exit(1)
-
-    init_db()
-    _asyncio.run(main_async())
+    main()
