@@ -3,6 +3,7 @@ Telegram Bot — Media Manager with native Telegram storage
 ==========================================================
 • No external cloud required — files are stored on Telegram's servers (file_id)
 • Album system inspired by modern photo gallery apps
+• Built-in support system with email notifications
 • Runs continuously on Hugging Face Spaces or any server
 """
 
@@ -10,20 +11,31 @@ import os
 import sys
 import logging
 import sqlite3
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8488403540:AAEoPyCMze1FKeNW94y-2Uf7QhXYC4qe4nc")
+# ── Environment config ────────────────────────────────────────────────────────
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 _data_dir = os.environ.get("DATA_DIR", "/app/data")
 DB_PATH = os.path.join(_data_dir, "media.db")
 
+SMTP_HOST     = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER     = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+ADMIN_EMAIL   = os.environ.get("ADMIN_EMAIL", "")
+
 # ── ConversationHandler states ────────────────────────────────────────────────
-(ASK_ALBUM_NAME,) = range(1)
+(ASK_ALBUM_NAME, SUPPORT_DESCRIBE, SUPPORT_EMAIL) = range(3)
 
 # ── SQLite database ───────────────────────────────────────────────────────────
 def init_db():
+    Path(_data_dir).mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.executescript("""
@@ -50,6 +62,15 @@ def init_db():
             duration        INTEGER,
             uploaded_at     TEXT NOT NULL,
             FOREIGN KEY (album_id) REFERENCES albums(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            username    TEXT,
+            email       TEXT NOT NULL,
+            issue       TEXT NOT NULL,
+            created_at  TEXT NOT NULL
         );
     """)
     con.commit()
@@ -108,7 +129,6 @@ def add_media(telegram_id, album_id, file_id, file_unique_id, media_type,
          file_name, mime_type, size_bytes, width, height, duration,
          datetime.utcnow().isoformat())
     )
-    # Set cover if the album doesn't have one yet
     if album_id:
         con.execute(
             "UPDATE albums SET cover_file_id=? WHERE id=? AND cover_file_id IS NULL",
@@ -186,15 +206,47 @@ def move_to_album(file_unique_id: str, telegram_id: int, album_id):
     )
     con.commit(); con.close()
 
-def get_pending_album(telegram_id: int):
-    """Returns the most recent file_unique_id pending album assignment."""
+def save_ticket(telegram_id: int, username: str, email: str, issue: str):
     con = sqlite3.connect(DB_PATH)
-    row = con.execute(
-        "SELECT file_unique_id FROM media WHERE telegram_id=? ORDER BY id DESC LIMIT 1",
-        (telegram_id,)
-    ).fetchone()
-    con.close()
-    return row[0] if row else None
+    con.execute(
+        "INSERT INTO support_tickets (telegram_id, username, email, issue, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (telegram_id, username, email, issue, datetime.utcnow().isoformat())
+    )
+    con.commit(); con.close()
+
+# ── Email ─────────────────────────────────────────────────────────────────────
+def send_email(to: str, subject: str, body: str, reply_to: str = None) -> bool:
+    if not SMTP_USER or not SMTP_PASSWORD:
+        log.warning("SMTP credentials not configured — email not sent")
+        return False
+    try:
+        msg = MIMEMultipart()
+        msg["From"]    = SMTP_USER
+        msg["To"]      = to
+        msg["Subject"] = subject
+        if reply_to:
+            msg["Reply-To"] = reply_to
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        log.info(f"Email sent to {to}")
+        return True
+    except Exception as e:
+        log.error(f"Failed to send email to {to}: {e}")
+        return False
+
+def validate_email_address(email_str: str):
+    """Returns normalized email string or None if invalid."""
+    try:
+        from email_validator import validate_email, EmailNotValidError
+        result = validate_email(email_str, check_deliverability=False)
+        return result.email
+    except Exception:
+        return None
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def fmt_size(b: int) -> str:
@@ -218,7 +270,7 @@ async def cmd_start(update, ctx):
          InlineKeyboardButton("🎬 Videos",    callback_data="browse:video:0")],
         [InlineKeyboardButton("🗂 Albums",    callback_data="albums_menu"),
          InlineKeyboardButton("📊 Insights",  callback_data="stats")],
-        [InlineKeyboardButton("❓ Help",       callback_data="help")],
+        [InlineKeyboardButton("🆘 Support",   callback_data="help")],
     ]
     await update.message.reply_text(
         "📱 *Welcome to your personal gallery*\n\n"
@@ -229,27 +281,105 @@ async def cmd_start(update, ctx):
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
-# ── /help ─────────────────────────────────────────────────────────────────────
-async def cmd_help(update, ctx):
+# ── Support flow (/help) ──────────────────────────────────────────────────────
+async def cmd_help_start(update, ctx):
     await update.message.reply_text(
-        "📚 *How it works*\n\n"
-        "1️⃣ Send any photo, video, audio, or file.\n"
-        "2️⃣ Choose which album to save it to — or skip.\n"
-        "3️⃣ Browse your gallery anytime with /gallery or the buttons below.\n\n"
-        "📌 *Commands*\n"
-        "/start — Main menu\n"
-        "/gallery — Browse your gallery\n"
-        "/albums — Manage albums\n"
-        "/new\\_album — Create a new album\n"
-        "/stats — Your storage insights\n"
-        "/help — This guide\n\n"
-        "💡 *Tip:* You can send multiple files at once and assign them to the same album.",
+        "🆘 *Support*\n\n"
+        "We're here to help. Please describe your issue below and we'll follow up with you by email.\n\n"
+        "What's going on?",
         parse_mode="Markdown"
     )
+    return SUPPORT_DESCRIBE
 
-async def cb_help(update, ctx):
+async def cb_help_start(update, ctx):
     await update.callback_query.answer()
-    await cmd_help(update, ctx)
+    await update.callback_query.message.reply_text(
+        "🆘 *Support*\n\n"
+        "We're here to help. Please describe your issue below and we'll follow up with you by email.\n\n"
+        "What's going on?",
+        parse_mode="Markdown"
+    )
+    return SUPPORT_DESCRIBE
+
+async def recv_support_issue(update, ctx):
+    issue = update.message.text.strip()
+    if not issue:
+        await update.message.reply_text("Please describe your issue so we can help you:")
+        return SUPPORT_DESCRIBE
+    ctx.user_data["support_issue"] = issue
+    await update.message.reply_text(
+        "Got it. What's your email address?\n\n"
+        "We'll send you a confirmation and follow up there."
+    )
+    return SUPPORT_EMAIL
+
+async def recv_support_email(update, ctx):
+    from telegram.ext import ConversationHandler
+    email_str = update.message.text.strip()
+
+    email = validate_email_address(email_str)
+    if not email:
+        await update.message.reply_text(
+            "That doesn't look like a valid email address. Please try again:"
+        )
+        return SUPPORT_EMAIL
+
+    issue    = ctx.user_data.pop("support_issue", "No description provided")
+    user     = update.effective_user
+    tid      = user.id
+    username = f"@{user.username}" if user.username else f"User #{tid}"
+
+    save_ticket(tid, username, email, issue)
+
+    user_subject = "We received your support request"
+    user_body = (
+        f"Hi,\n\n"
+        f"Thank you for reaching out. We've received your request and our team will get back to you shortly.\n\n"
+        f"──────────────────────\n"
+        f"Your message:\n\n"
+        f"{issue}\n"
+        f"──────────────────────\n\n"
+        f"If you have additional details to share, simply reply to this email.\n\n"
+        f"Best regards,\n"
+        f"The Support Team"
+    )
+
+    admin_subject = f"[Support] New request from {username}"
+    admin_body = (
+        f"A new support request was submitted via Telegram.\n\n"
+        f"──────────────────────\n"
+        f"From:      {username}\n"
+        f"Telegram:  {tid}\n"
+        f"Email:     {email}\n"
+        f"Date:      {fmt_date(datetime.utcnow().isoformat())}\n"
+        f"──────────────────────\n\n"
+        f"Issue:\n\n"
+        f"{issue}\n\n"
+        f"──────────────────────\n"
+        f"Reply to this email to respond directly to the user."
+    )
+
+    user_sent = send_email(email, user_subject, user_body)
+    if ADMIN_EMAIL:
+        send_email(ADMIN_EMAIL, admin_subject, admin_body, reply_to=email)
+
+    ctx.user_data.clear()
+
+    if user_sent:
+        await update.message.reply_text(
+            "✅ *Support request received*\n\n"
+            f"A confirmation has been sent to *{email}*.\n"
+            "Our team will get back to you as soon as possible.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "✅ *Support request received*\n\n"
+            "Our team has been notified and will reach out to you.\n\n"
+            "_(Email delivery is currently unavailable — your request is saved.)_",
+            parse_mode="Markdown"
+        )
+    return ConversationHandler.END
 
 # ── Receive media ─────────────────────────────────────────────────────────────
 async def _save_media(update, ctx, media_type: str):
@@ -280,7 +410,7 @@ async def _save_media(update, ctx, media_type: str):
         file_name = getattr(obj, "file_name", None) or "audio.ogg"
         mime_type = getattr(obj, "mime_type", None) or "audio/ogg"
 
-    else:  # document
+    else:
         obj = msg.document
         file_id, file_unique_id = obj.file_id, obj.file_unique_id
         width, height, duration = None, None, None
@@ -288,14 +418,12 @@ async def _save_media(update, ctx, media_type: str):
         file_name = obj.file_name or "file"
         mime_type = obj.mime_type or "application/octet-stream"
 
-    # Save without album first
     add_media(tid, None, file_id, file_unique_id, media_type,
               file_name, mime_type, size_bytes, width, height, duration)
 
     ctx.user_data["last_file_unique_id"] = file_unique_id
     ctx.user_data["last_media_type"] = media_type
 
-    # Buttons: existing albums + no album + new album
     albums = get_albums(tid)
     kb = []
     row = []
@@ -309,8 +437,8 @@ async def _save_media(update, ctx, media_type: str):
     if row:
         kb.append(row)
     kb.append([
-        InlineKeyboardButton("📁 No album",      callback_data=f"assign:{file_unique_id}:none"),
-        InlineKeyboardButton("➕ New album",      callback_data=f"newalbum:{file_unique_id}")
+        InlineKeyboardButton("📁 No album",  callback_data=f"assign:{file_unique_id}:none"),
+        InlineKeyboardButton("➕ New album", callback_data=f"newalbum:{file_unique_id}")
     ])
 
     ICONS = {"photo": "🖼", "video": "🎬", "audio": "🎵", "document": "📄"}
@@ -408,8 +536,8 @@ async def cmd_albums(update, ctx):
             callback_data=f"album:{a['id']}:0"
         )])
     kb.append([
-        InlineKeyboardButton("➕ New album",  callback_data="create_album_menu"),
-        InlineKeyboardButton("🏠 Home",        callback_data="main_menu")
+        InlineKeyboardButton("➕ New album", callback_data="create_album_menu"),
+        InlineKeyboardButton("🏠 Home",       callback_data="main_menu")
     ])
     await update.message.reply_text(
         f"🗂 *Your Albums* ({len(albums)})\n\nSelect an album to view its contents:",
@@ -437,8 +565,8 @@ async def cb_albums_menu(update, ctx):
             callback_data=f"album:{a['id']}:0"
         )])
     kb.append([
-        InlineKeyboardButton("➕ New album",  callback_data="create_album_menu"),
-        InlineKeyboardButton("🏠 Home",        callback_data="main_menu")
+        InlineKeyboardButton("➕ New album", callback_data="create_album_menu"),
+        InlineKeyboardButton("🏠 Home",       callback_data="main_menu")
     ])
     await update.callback_query.message.edit_text(
         f"🗂 *Your Albums* ({len(albums)})\n\nSelect an album to view its contents:",
@@ -459,7 +587,7 @@ async def cb_album_view(update, ctx):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     await update.callback_query.answer()
     tid = update.effective_user.id
-    parts = update.callback_query.data.split(":")  # album:ID:PAGE
+    parts = update.callback_query.data.split(":")
     album_id, page = int(parts[1]), int(parts[2])
     album = get_album(album_id, tid)
     if not album:
@@ -471,8 +599,8 @@ async def cb_album_view(update, ctx):
     total = count_media(tid, album_id=album_id)
 
     if not items:
-        kb = [[InlineKeyboardButton("🗂 My Albums",     callback_data="albums_menu"),
-               InlineKeyboardButton("🗑 Delete Album",  callback_data=f"del_album:{album_id}")]]
+        kb = [[InlineKeyboardButton("🗂 My Albums",    callback_data="albums_menu"),
+               InlineKeyboardButton("🗑 Delete album", callback_data=f"del_album:{album_id}")]]
         await update.callback_query.message.edit_text(
             f"📂 *{album['name']}*\n\nThis album is empty.",
             parse_mode="Markdown",
@@ -502,19 +630,18 @@ async def cb_album_view(update, ctx):
     kb = []
     if nav: kb.append(nav)
     kb.append([
-        InlineKeyboardButton("📤 View files",    callback_data=f"send_album:{album_id}:{page}"),
-        InlineKeyboardButton("🗑 Delete album",  callback_data=f"del_album:{album_id}")
+        InlineKeyboardButton("📤 View files",   callback_data=f"send_album:{album_id}:{page}"),
+        InlineKeyboardButton("🗑 Delete album", callback_data=f"del_album:{album_id}")
     ])
     kb.append([
-        InlineKeyboardButton("🗂 My Albums",  callback_data="albums_menu"),
-        InlineKeyboardButton("🏠 Home",        callback_data="main_menu")
+        InlineKeyboardButton("🗂 My Albums", callback_data="albums_menu"),
+        InlineKeyboardButton("🏠 Home",       callback_data="main_menu")
     ])
     await update.callback_query.message.edit_text(
         text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
     )
 
 async def cb_send_album(update, ctx):
-    """Sends the album's files as Telegram messages."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     await update.callback_query.answer("Sending files…")
     tid = update.effective_user.id
@@ -551,8 +678,8 @@ async def cb_delete_album(update, ctx):
         await update.callback_query.message.edit_text("Album not found.")
         return
     kb = [[
-        InlineKeyboardButton("✅ Yes, delete",  callback_data=f"confirm_del_album:{album_id}"),
-        InlineKeyboardButton("❌ Cancel",        callback_data=f"album:{album_id}:0")
+        InlineKeyboardButton("✅ Yes, delete", callback_data=f"confirm_del_album:{album_id}"),
+        InlineKeyboardButton("❌ Cancel",       callback_data=f"album:{album_id}:0")
     ]]
     await update.callback_query.message.edit_text(
         f"⚠️ Delete album *{album['name']}*?\n\n"
@@ -580,12 +707,12 @@ async def cb_confirm_delete_album(update, ctx):
 async def cmd_gallery(update, ctx):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     kb = [
-        [InlineKeyboardButton("🖼 Photos",      callback_data="browse:photo:0"),
-         InlineKeyboardButton("🎬 Videos",      callback_data="browse:video:0")],
-        [InlineKeyboardButton("🎵 Audio",        callback_data="browse:audio:0"),
-         InlineKeyboardButton("📄 Documents",   callback_data="browse:document:0")],
-        [InlineKeyboardButton("📦 All",          callback_data="browse:all:0"),
-         InlineKeyboardButton("🗂 Albums",       callback_data="albums_menu")],
+        [InlineKeyboardButton("🖼 Photos",    callback_data="browse:photo:0"),
+         InlineKeyboardButton("🎬 Videos",    callback_data="browse:video:0")],
+        [InlineKeyboardButton("🎵 Audio",     callback_data="browse:audio:0"),
+         InlineKeyboardButton("📄 Documents", callback_data="browse:document:0")],
+        [InlineKeyboardButton("📦 All",       callback_data="browse:all:0"),
+         InlineKeyboardButton("🗂 Albums",    callback_data="albums_menu")],
     ]
     await update.message.reply_text(
         "🖼 *Your Gallery*\n\nWhat would you like to explore?",
@@ -634,15 +761,14 @@ async def cb_browse(update, ctx):
     kb = []
     if nav: kb.append(nav)
     kb.append([
-        InlineKeyboardButton("📤 Send this page",  callback_data=f"send_browse:{mtype}:{page}"),
-        InlineKeyboardButton("🏠 Home",             callback_data="main_menu")
+        InlineKeyboardButton("📤 Send this page", callback_data=f"send_browse:{mtype}:{page}"),
+        InlineKeyboardButton("🏠 Home",            callback_data="main_menu")
     ])
     await update.callback_query.message.edit_text(
         text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
     )
 
 async def cb_send_browse(update, ctx):
-    """Sends the files on the current gallery page."""
     await update.callback_query.answer("Sending…")
     tid = update.effective_user.id
     _, mtype, pg = update.callback_query.data.split(":")
@@ -673,13 +799,13 @@ async def cmd_stats(update, ctx):
     kb = [[InlineKeyboardButton("🏠 Home", callback_data="main_menu")]]
     text = (
         "📊 *Your Insights*\n\n"
-        f"🖼 Photos:       {s['photos']}\n"
-        f"🎬 Videos:       {s['videos']}\n"
-        f"🎵 Audio:        {s['audios']}\n"
-        f"📄 Documents:    {s['docs']}\n"
-        f"📦 Total files:  {s['total']}\n"
-        f"🗂 Albums:       {s['albums']}\n"
-        f"💾 Storage used: {fmt_size(s['total_size'])}\n\n"
+        f"🖼 Photos:        {s['photos']}\n"
+        f"🎬 Videos:        {s['videos']}\n"
+        f"🎵 Audio:         {s['audios']}\n"
+        f"📄 Documents:     {s['docs']}\n"
+        f"📦 Total files:   {s['total']}\n"
+        f"🗂 Albums:        {s['albums']}\n"
+        f"💾 Storage used:  {fmt_size(s['total_size'])}\n\n"
         "_All files are stored securely on Telegram's servers_"
     )
     if update.message:
@@ -698,11 +824,11 @@ async def cb_main_menu(update, ctx):
     await update.callback_query.answer()
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     kb = [
-        [InlineKeyboardButton("📸 Photos",      callback_data="browse:photo:0"),
-         InlineKeyboardButton("🎬 Videos",      callback_data="browse:video:0")],
-        [InlineKeyboardButton("🗂 Albums",       callback_data="albums_menu"),
-         InlineKeyboardButton("📊 Insights",    callback_data="stats")],
-        [InlineKeyboardButton("❓ Help",          callback_data="help")],
+        [InlineKeyboardButton("📸 Photos",   callback_data="browse:photo:0"),
+         InlineKeyboardButton("🎬 Videos",   callback_data="browse:video:0")],
+        [InlineKeyboardButton("🗂 Albums",   callback_data="albums_menu"),
+         InlineKeyboardButton("📊 Insights", callback_data="stats")],
+        [InlineKeyboardButton("🆘 Support",  callback_data="help")],
     ]
     await update.callback_query.message.edit_text(
         "📱 *Home*\n\nSend me a file or choose an option below:",
@@ -718,13 +844,27 @@ def _build_app():
     )
 
     if not TELEGRAM_TOKEN:
-        log.error("TELEGRAM_TOKEN is not set. Add the environment variable TELEGRAM_TOKEN and restart.")
-        import sys; sys.exit(1)
+        log.error("TELEGRAM_TOKEN is not set. Add the environment variable and restart.")
+        sys.exit(1)
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # ConversationHandler for album creation
-    # per_message=False works correctly with callbacks
+    # ── Support conversation ──
+    support_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("help",        cmd_help_start),
+            CallbackQueryHandler(cb_help_start, pattern="^help$"),
+        ],
+        states={
+            SUPPORT_DESCRIBE: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_support_issue)],
+            SUPPORT_EMAIL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_support_email)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        per_message=False,
+        per_chat=True,
+    )
+
+    # ── Album creation conversation ──
     album_conv = ConversationHandler(
         entry_points=[
             CommandHandler("new_album", cmd_new_album),
@@ -739,18 +879,17 @@ def _build_app():
         per_chat=True,
     )
 
+    application.add_handler(support_conv)
     application.add_handler(album_conv)
 
     # Commands
-    application.add_handler(CommandHandler("start",      cmd_start))
-    application.add_handler(CommandHandler("help",       cmd_help))
-    application.add_handler(CommandHandler("gallery",    cmd_gallery))
-    application.add_handler(CommandHandler("albums",     cmd_albums))
-    application.add_handler(CommandHandler("stats",      cmd_stats))
+    application.add_handler(CommandHandler("start",   cmd_start))
+    application.add_handler(CommandHandler("gallery", cmd_gallery))
+    application.add_handler(CommandHandler("albums",  cmd_albums))
+    application.add_handler(CommandHandler("stats",   cmd_stats))
 
     # Callbacks
     application.add_handler(CallbackQueryHandler(cb_main_menu,            pattern="^main_menu$"))
-    application.add_handler(CallbackQueryHandler(cb_help,                 pattern="^help$"))
     application.add_handler(CallbackQueryHandler(cb_stats,                pattern="^stats$"))
     application.add_handler(CallbackQueryHandler(cb_albums_menu,          pattern="^albums_menu$"))
     application.add_handler(CallbackQueryHandler(cb_album_view,           pattern=r"^album:\d+:\d+$"))
@@ -771,7 +910,6 @@ def _build_app():
 
 
 async def main_async():
-    """Main coroutine — called from app.py with its own event loop."""
     application = _build_app()
     log.info("Bot started with polling")
     async with application:

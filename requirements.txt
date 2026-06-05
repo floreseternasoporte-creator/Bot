@@ -1,1 +1,2 @@
 python-telegram-bot==21.6
+email-validator==2.1.1
