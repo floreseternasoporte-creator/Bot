@@ -1,0 +1,18 @@
+# Telegram
+python-telegram-bot==21.6
+
+# Transcripción — instalar desde git tag estable para evitar pkg_resources
+openai-whisper @ git+https://github.com/openai/whisper.git@v20231117
+
+# Traducción offline
+argostranslate==1.9.6
+
+# Síntesis de voz con clonación (XTTS-v2)
+TTS==0.22.0
+
+# Audio/ML (torch se instala antes en el Dockerfile)
+numpy==1.26.4
+soundfile==0.12.1
+
+# Utilidades
+ffmpeg-python==0.2.0
