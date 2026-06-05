@@ -21,6 +21,7 @@ import tempfile
 import shutil
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -62,6 +63,26 @@ ARGOS_LANG_MAP = {
 
 # Estados
 WAITING_LANG = "waiting_lang"
+PENDING_MEDIA_KEY = "pending_media"
+MARKDOWN_V2_SPECIALS = r"_*[]()~`>#+-=|{}.!"
+
+
+def escape_markdown_v2(text: str) -> str:
+    """Escapa texto dinámico antes de insertarlo en mensajes MarkdownV2."""
+    return "".join(
+        f"\\{char}" if char in MARKDOWN_V2_SPECIALS else char
+        for char in str(text)
+    )
+
+
+def store_pending_media(ctx, file_id, file_type):
+    """Guarda el archivo pendiente con una clave corta segura para callback_data."""
+    media_key = uuid4().hex[:16]
+    ctx.user_data.setdefault(PENDING_MEDIA_KEY, {})[media_key] = {
+        "file_id": file_id,
+        "file_type": file_type,
+    }
+    return media_key
 
 # ── Base de datos ──────────────────────────────────────────────────────────────
 def init_db():
@@ -324,12 +345,12 @@ async def cb_my_jobs(update, ctx):
         lines.append(f"{icon} {lang_name} · {dt}")
     await update.callback_query.message.edit_text("\n".join(lines), parse_mode="Markdown")
 
-def _lang_keyboard(file_unique_id: str):
+def _lang_keyboard(media_key: str):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     kb = []
     row = []
     for code, label in LANGUAGES.items():
-        row.append(InlineKeyboardButton(label, callback_data=f"dub:{file_unique_id}:{code}"))
+        row.append(InlineKeyboardButton(label, callback_data=f"dub:{media_key}:{code}"))
         if len(row) == 2:
             kb.append(row); row = []
     if row:
@@ -338,10 +359,11 @@ def _lang_keyboard(file_unique_id: str):
     return InlineKeyboardMarkup(kb)
 
 async def _handle_media(update, ctx, file_id, file_unique_id, file_type, display_name):
-    kb = _lang_keyboard(file_unique_id)
-    ctx.user_data[file_unique_id] = {"file_id": file_id, "file_type": file_type}
+    media_key = store_pending_media(ctx, file_id, file_type)
+    kb = _lang_keyboard(media_key)
+    safe_display_name = escape_markdown_v2(display_name)
     await update.message.reply_text(
-        f"🎬 *{display_name}* recibido\\!\n\n"
+        f"🎬 *{safe_display_name}* recibido\\!\n\n"
         "¿A qué idioma quieres doblarlo?\n"
         "_Selecciona el idioma de destino:_",
         parse_mode="MarkdownV2",
@@ -378,21 +400,33 @@ async def handle_document(update, ctx):
                         d.file_name or "archivo")
 
 async def cb_cancel_dub(update, ctx):
+    ctx.user_data.pop(PENDING_MEDIA_KEY, None)
     await update.callback_query.answer("Cancelado")
     await update.callback_query.message.edit_text("❌ Doblaje cancelado.")
+
+async def error_handler(update, ctx):
+    log.exception("Error no controlado en Telegram", exc_info=ctx.error)
+    if update and getattr(update, "effective_message", None):
+        try:
+            await update.effective_message.reply_text(
+                "❌ Ocurrió un error inesperado al recibir tu archivo. "
+                "Intenta enviarlo de nuevo o usa /ayuda."
+            )
+        except Exception:
+            log.exception("No se pudo notificar el error al usuario")
 
 async def cb_dub(update, ctx):
     """El usuario eligió el idioma — arranca el pipeline."""
     await update.callback_query.answer()
     query = update.callback_query
-    _, file_unique_id, dst_lang = query.data.split(":", 2)
+    _, media_key, dst_lang = query.data.split(":", 2)
 
     tid = update.effective_user.id
     chat_id = update.effective_chat.id
     lang_name = LANGUAGES.get(dst_lang, dst_lang)
 
     # Recuperar file_id
-    media_info = ctx.user_data.get(file_unique_id)
+    media_info = ctx.user_data.get(PENDING_MEDIA_KEY, {}).get(media_key)
     if not media_info:
         await query.message.edit_text("⚠️ No encontré el archivo. Por favor envíalo de nuevo.")
         return
@@ -465,7 +499,7 @@ async def cb_dub(update, ctx):
         )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-        ctx.user_data.pop(file_unique_id, None)
+        ctx.user_data.get(PENDING_MEDIA_KEY, {}).pop(media_key, None)
 
 # ── Build app ──────────────────────────────────────────────────────────────────
 def _build_app():
@@ -496,6 +530,8 @@ def _build_app():
                                    filters.Document.AUDIO,              handle_document))
     # Documentos genéricos (mov, mkv, etc.)
     app.add_handler(MessageHandler(filters.Document.ALL,                handle_document))
+
+    app.add_error_handler(error_handler)
 
     return app
 

@@ -1,0 +1,3 @@
+# Global ML compatibility constraints
+# Keep NumPy on the 1.x ABI required by the current Whisper/TTS stack.
+numpy==1.26.4
