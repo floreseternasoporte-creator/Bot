@@ -1,4 +1,8 @@
 python-telegram-bot==21.6
-openai
+openai-whisper
+torch
+torchvision
+torchaudio
 moviepy
 googletrans-py
+setuptools

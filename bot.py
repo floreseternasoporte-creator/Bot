@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from moviepy.editor import VideoFileClip
 from googletrans import Translator
+import whisper
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -20,18 +21,15 @@ logger = logging.getLogger(__name__)
 
 # Environment variables
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 if not TELEGRAM_TOKEN:
     logger.error("TELEGRAM_TOKEN no está configurado en las variables de entorno.")
     exit(1)
-if not OPENAI_API_KEY:
-    logger.error("OPENAI_API_KEY no está configurado en las variables de entorno.")
-    exit(1)
 
-# Initialize OpenAI client
-from openai import OpenAI
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Load Whisper model
+logger.info("Cargando modelo Whisper (esto puede tardar un poco)...")
+model = whisper.load_model("base") # Puedes cambiar a "small", "medium", etc. para mejor precisión/velocidad
+logger.info("Modelo Whisper cargado.")
 
 # Supported languages for translation
 SUPPORTED_LANGUAGES = {
@@ -113,7 +111,7 @@ async def done_selecting_languages(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("Parece que no se ha subido ningún video o no se han seleccionado idiomas. Por favor, envía un video y selecciona los idiomas.")
         return
 
-    await update.message.reply_text(f"¡Entendido! Generando subtítulos en {', '.join([SUPPORTED_LANGUAGES[lang] for lang in selected_languages])}. Esto puede tardar un poco...")
+    await update.message.reply_text(f"¡Entendido! Generando subtítulos en {", ".join([SUPPORTED_LANGUAGES[lang] for lang in selected_languages])}. Esto puede tardar un poco...")
 
     try:
         # Download the video
@@ -131,35 +129,28 @@ async def done_selecting_languages(update: Update, context: ContextTypes.DEFAULT
             logger.info(f"Audio extraído a {audio_path}")
 
             # Transcribe audio using Whisper
-            await update.message.reply_text("Transcribiendo audio con Whisper...")
-            with open(audio_path, "rb") as audio_file:
-                transcript = client.audio.transcriptions.create(
-                    model="whisper-1", 
-                    file=audio_file, 
-                    response_format="verbose_json",
-                    timestamp_granularities=["segment"]
-                )
+            await update.message.reply_text("Transcribiendo audio con Whisper (local)...")
+            result = model.transcribe(str(audio_path))
             logger.info("Transcripción completada.")
             
             # Generate SRT for each selected language
             translator = Translator()
             for lang_code in selected_languages:
                 srt_content = ""
-                for segment in transcript.segments:
-                    start_time = segment['start']
-                    end_time = segment['end']
-                    text = segment['text'].strip()
+                for i, segment in enumerate(result["segments"]):
+                    start_time = segment["start"]
+                    end_time = segment["end"]
+                    text = segment["text"].strip()
 
-                    # Translate if not the original language (Whisper transcribes to English by default if not specified)
-                    # Assuming Whisper's default output is English for simplicity, or detecting if it's different
-                    # For a more robust solution, detect source language of transcript first
+                    # Translate if not the original language (Whisper detects language, but we'll assume English for simplicity or translate if different)
+                    # For a more robust solution, detect source language of transcript first if needed
                     translated_text = text
-                    if lang_code != "en": # Assuming English is the default transcription language
+                    if lang_code != result["language"]:
                         await update.message.reply_text(f"Traduciendo a {SUPPORTED_LANGUAGES[lang_code]}...")
-                        translated_obj = translator.translate(text, dest=lang_code)
+                        translated_obj = translator.translate(text, dest=lang_code, src=result["language"])
                         translated_text = translated_obj.text
 
-                    srt_content += f"{segment['id'] + 1}\n"
+                    srt_content += f"{i + 1}\n"
                     srt_content += f"{format_timestamp(start_time)} --> {format_timestamp(end_time)}\n"
                     srt_content += f"{translated_text}\n\n"
                 
@@ -169,7 +160,7 @@ async def done_selecting_languages(update: Update, context: ContextTypes.DEFAULT
                     f.write(srt_content)
                 
                 await update.message.reply_document(document=srt_path, caption=f"Subtítulos en {SUPPORTED_LANGUAGES[lang_code]}")
-                logger.info(f"Subtítulos en {lang_name} enviados.")
+                logger.info(f"Subtítulos en {SUPPORTED_LANGUAGES[lang_code]} enviados.")
 
     except Exception as e:
         logger.error(f"Error al procesar el video: {e}", exc_info=True)
