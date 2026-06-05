@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Paso 1: setuptools + wheel (evita el error pkg_resources) ─────────────────
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir --upgrade pip "setuptools<75" wheel
 
 # ── Paso 2: PyTorch CPU (índice separado) ─────────────────────────────────────
 RUN pip install --no-cache-dir \
