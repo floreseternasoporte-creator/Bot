@@ -24,6 +24,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ── Paso 1: setuptools + wheel (evita el error pkg_resources) ─────────────────
 RUN pip install --no-cache-dir --upgrade pip "setuptools<75" wheel
 
+# ── Constraints globales para evitar mezclas incompatibles de NumPy 1.x/2.x ───
+COPY constraints.txt .
+ENV PIP_CONSTRAINT=/app/constraints.txt
+
+# Instalar NumPy antes de librerías con extensiones nativas evita que Whisper/TTS
+# descarguen NumPy 2.x temporalmente y dejen extensiones compiladas incompatibles.
+RUN pip install --no-cache-dir "numpy==1.26.4"
+
 # ── Paso 2: PyTorch CPU (índice separado) ─────────────────────────────────────
 RUN pip install --no-cache-dir \
     torch==2.2.2 torchaudio==2.2.2 \
@@ -36,6 +44,19 @@ RUN pip install --no-cache-dir --no-build-isolation \
 # ── Paso 4: Resto de dependencias ─────────────────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Verificación temprana: si NumPy queda roto, el deploy falla durante build y no
+# en mitad de un doblaje de Telegram.
+RUN python - <<'PY'
+import numpy
+import numpy.core.multiarray
+import torch
+import torchaudio
+import whisper
+import argostranslate.translate
+from TTS.api import TTS
+print("dependency smoke test ok", numpy.__version__)
+PY
 
 # ── Código fuente ──────────────────────────────────────────────────────────────
 COPY bot.py .
