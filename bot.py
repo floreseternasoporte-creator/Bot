@@ -21,6 +21,8 @@ import tempfile
 import shutil
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
+from uuid import uuid4
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -28,10 +30,16 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8488403540:AAEoPyCMze1FKeNW94y-2Uf7QhXYC4qe4nc")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "dubbot.db"
+BOT_MODE = os.environ.get("BOT_MODE", "auto").strip().lower()
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "telegram-webhook").strip("/") or "telegram-webhook"
+WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN", "").strip() or None
+WEBHOOK_LISTEN = os.environ.get("WEBHOOK_LISTEN", "0.0.0.0")
+WEBHOOK_PORT = int(os.environ.get("PORT", os.environ.get("WEBHOOK_PORT", "8080")))
 
 # ── Idiomas soportados ─────────────────────────────────────────────────────────
 LANGUAGES = {
@@ -62,6 +70,64 @@ ARGOS_LANG_MAP = {
 
 # Estados
 WAITING_LANG = "waiting_lang"
+PENDING_MEDIA_KEY = "pending_media"
+MARKDOWN_V2_SPECIALS = r"_*[]()~`>#+-=|{}.!"
+
+
+def escape_markdown_v2(text: str) -> str:
+    """Escapa texto dinámico antes de insertarlo en mensajes MarkdownV2."""
+    return "".join(
+        f"\\{char}" if char in MARKDOWN_V2_SPECIALS else char
+        for char in str(text)
+    )
+
+
+def store_pending_media(ctx, file_id, file_type):
+    """Guarda el archivo pendiente con una clave corta segura para callback_data."""
+    media_key = uuid4().hex[:16]
+    ctx.user_data.setdefault(PENDING_MEDIA_KEY, {})[media_key] = {
+        "file_id": file_id,
+        "file_type": file_type,
+    }
+    return media_key
+
+
+def get_public_webhook_url() -> str | None:
+    """Devuelve la URL pública del webhook si el entorno la proporciona."""
+    if WEBHOOK_URL:
+        return WEBHOOK_URL.rstrip("/")
+
+    railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if railway_domain:
+        return f"https://{railway_domain.rstrip('/')}/{WEBHOOK_PATH}"
+
+    return None
+
+
+def webhook_path_from_url(webhook_url: str) -> str:
+    """Extrae el path que debe escuchar PTB desde la URL pública del webhook."""
+    parsed = urlparse(webhook_url)
+    return parsed.path.strip("/") or WEBHOOK_PATH
+
+
+def should_use_webhook() -> tuple[bool, str | None]:
+    """Decide si arrancar en webhook o polling según BOT_MODE y entorno."""
+    webhook_url = get_public_webhook_url()
+
+    if BOT_MODE == "webhook":
+        if not webhook_url:
+            raise RuntimeError(
+                "BOT_MODE=webhook requiere WEBHOOK_URL o RAILWAY_PUBLIC_DOMAIN"
+            )
+        return True, webhook_url
+
+    if BOT_MODE == "polling":
+        return False, None
+
+    if BOT_MODE != "auto":
+        raise RuntimeError("BOT_MODE debe ser auto, webhook o polling")
+
+    return bool(webhook_url), webhook_url
 
 # ── Base de datos ──────────────────────────────────────────────────────────────
 def init_db():
@@ -324,12 +390,12 @@ async def cb_my_jobs(update, ctx):
         lines.append(f"{icon} {lang_name} · {dt}")
     await update.callback_query.message.edit_text("\n".join(lines), parse_mode="Markdown")
 
-def _lang_keyboard(file_unique_id: str):
+def _lang_keyboard(media_key: str):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     kb = []
     row = []
     for code, label in LANGUAGES.items():
-        row.append(InlineKeyboardButton(label, callback_data=f"dub:{file_unique_id}:{code}"))
+        row.append(InlineKeyboardButton(label, callback_data=f"dub:{media_key}:{code}"))
         if len(row) == 2:
             kb.append(row); row = []
     if row:
@@ -338,10 +404,11 @@ def _lang_keyboard(file_unique_id: str):
     return InlineKeyboardMarkup(kb)
 
 async def _handle_media(update, ctx, file_id, file_unique_id, file_type, display_name):
-    kb = _lang_keyboard(file_unique_id)
-    ctx.user_data[file_unique_id] = {"file_id": file_id, "file_type": file_type}
+    media_key = store_pending_media(ctx, file_id, file_type)
+    kb = _lang_keyboard(media_key)
+    safe_display_name = escape_markdown_v2(display_name)
     await update.message.reply_text(
-        f"🎬 *{display_name}* recibido\\!\n\n"
+        f"🎬 *{safe_display_name}* recibido\\!\n\n"
         "¿A qué idioma quieres doblarlo?\n"
         "_Selecciona el idioma de destino:_",
         parse_mode="MarkdownV2",
@@ -378,21 +445,45 @@ async def handle_document(update, ctx):
                         d.file_name or "archivo")
 
 async def cb_cancel_dub(update, ctx):
+    ctx.user_data.pop(PENDING_MEDIA_KEY, None)
     await update.callback_query.answer("Cancelado")
     await update.callback_query.message.edit_text("❌ Doblaje cancelado.")
+
+async def error_handler(update, ctx):
+    from telegram.error import Conflict
+
+    if isinstance(ctx.error, Conflict):
+        log.critical(
+            "Telegram rechazó el polling porque hay otra instancia usando "
+            "getUpdates con el mismo TELEGRAM_TOKEN. Detén la otra copia del "
+            "bot o usa BOT_MODE=webhook/WEBHOOK_URL. Cerrando esta instancia "
+            "para evitar conflictos repetidos."
+        )
+        ctx.application.stop_running()
+        return
+
+    log.exception("Error no controlado en Telegram", exc_info=ctx.error)
+    if update and getattr(update, "effective_message", None):
+        try:
+            await update.effective_message.reply_text(
+                "❌ Ocurrió un error inesperado al recibir tu archivo. "
+                "Intenta enviarlo de nuevo o usa /ayuda."
+            )
+        except Exception:
+            log.exception("No se pudo notificar el error al usuario")
 
 async def cb_dub(update, ctx):
     """El usuario eligió el idioma — arranca el pipeline."""
     await update.callback_query.answer()
     query = update.callback_query
-    _, file_unique_id, dst_lang = query.data.split(":", 2)
+    _, media_key, dst_lang = query.data.split(":", 2)
 
     tid = update.effective_user.id
     chat_id = update.effective_chat.id
     lang_name = LANGUAGES.get(dst_lang, dst_lang)
 
     # Recuperar file_id
-    media_info = ctx.user_data.get(file_unique_id)
+    media_info = ctx.user_data.get(PENDING_MEDIA_KEY, {}).get(media_key)
     if not media_info:
         await query.message.edit_text("⚠️ No encontré el archivo. Por favor envíalo de nuevo.")
         return
@@ -465,7 +556,7 @@ async def cb_dub(update, ctx):
         )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-        ctx.user_data.pop(file_unique_id, None)
+        ctx.user_data.get(PENDING_MEDIA_KEY, {}).pop(media_key, None)
 
 # ── Build app ──────────────────────────────────────────────────────────────────
 def _build_app():
@@ -497,17 +588,35 @@ def _build_app():
     # Documentos genéricos (mov, mkv, etc.)
     app.add_handler(MessageHandler(filters.Document.ALL,                handle_document))
 
+    app.add_error_handler(error_handler)
+
     return app
 
-async def main_async():
+def run_bot():
     app = _build_app()
-    log.info("DubBot iniciado con polling")
-    async with app:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        stop = asyncio.Event()
-        await stop.wait()
+    use_webhook, webhook_url = should_use_webhook()
+
+    if use_webhook:
+        url_path = webhook_path_from_url(webhook_url)
+        log.info(
+            "DubBot iniciado con webhook en %s:%s/%s → %s",
+            WEBHOOK_LISTEN, WEBHOOK_PORT, url_path, webhook_url
+        )
+        app.run_webhook(
+            listen=WEBHOOK_LISTEN,
+            port=WEBHOOK_PORT,
+            url_path=url_path,
+            webhook_url=webhook_url,
+            secret_token=WEBHOOK_SECRET_TOKEN,
+            drop_pending_updates=True,
+        )
+        return
+
+    log.info(
+        "DubBot iniciado con polling. Si aparece un 409 Conflict, hay otra "
+        "instancia activa con el mismo TELEGRAM_TOKEN."
+    )
+    app.run_polling(drop_pending_updates=True, bootstrap_retries=0)
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
@@ -522,4 +631,4 @@ if __name__ == "__main__":
         sys.exit(1)
 
     init_db()
-    asyncio.run(main_async())
+    run_bot()
