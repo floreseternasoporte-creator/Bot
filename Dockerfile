@@ -29,7 +29,11 @@ RUN pip install --no-cache-dir \
     torch==2.2.2 torchaudio==2.2.2 \
     --index-url https://download.pytorch.org/whl/cpu
 
-# ── Paso 3: Resto de dependencias ─────────────────────────────────────────────
+# ── Paso 3: Whisper (needs --no-build-isolation for pkg_resources) ────────────
+RUN pip install --no-cache-dir --no-build-isolation \
+    "openai-whisper @ git+https://github.com/openai/whisper.git@v20231117"
+
+# ── Paso 4: Resto de dependencias ─────────────────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
