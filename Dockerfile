@@ -1,8 +1,8 @@
-FROM python:3.11-slim-buster
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# Instalar ffmpeg y otras dependencias del sistema
+# Instalar ffmpeg y dependencias de sistema necesarias
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     build-essential \
