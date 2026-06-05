@@ -1,8 +1,8 @@
 # Telegram
 python-telegram-bot==21.6
 
-# Transcripción — instalar desde git tag estable para evitar pkg_resources
-openai-whisper @ git+https://github.com/openai/whisper.git@v20231117
+# Transcripción — whisper se instala aparte en el Dockerfile con --no-build-isolation
+# openai-whisper @ git+https://github.com/openai/whisper.git@v20231117
 
 # Traducción offline
 argostranslate==1.9.6
