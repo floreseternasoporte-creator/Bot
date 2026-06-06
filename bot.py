@@ -2,7 +2,7 @@ import os
 import logging
 import tempfile
 from pathlib import Path
-from moviepy.editor import VideoFileClip
+from moviepy import VideoFileClip
 from deep_translator import GoogleTranslator
 import whisper
 
