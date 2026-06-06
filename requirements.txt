@@ -9,4 +9,5 @@ edge-tts
 librosa
 pydub
 numpy
+scikit-learn
 setuptools
