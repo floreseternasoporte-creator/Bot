@@ -2,7 +2,10 @@ import os
 import logging
 import tempfile
 import subprocess
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
 from moviepy import VideoFileClip
 from deep_translator import GoogleTranslator
 import whisper
@@ -24,8 +27,8 @@ if not TELEGRAM_TOKEN:
     logger.error("TELEGRAM_TOKEN no está configurado.")
     exit(1)
 
-logger.info("Cargando modelo Whisper...")
-model = whisper.load_model("base")
+logger.info("Cargando modelo Whisper (tiny)...")
+model = whisper.load_model("tiny")
 logger.info("Modelo Whisper cargado.")
 
 SUPPORTED_LANGUAGES = {
