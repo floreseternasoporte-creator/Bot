@@ -6,6 +6,7 @@ torchaudio
 moviepy
 deep-translator
 edge-tts
+gtts
 librosa
 pydub
 numpy

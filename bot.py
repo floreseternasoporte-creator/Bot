@@ -8,10 +8,12 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
 
+import asyncio
 import numpy as np
 import librosa
 import whisper
 import edge_tts
+from gtts import gTTS
 from moviepy import VideoFileClip
 from pydub import AudioSegment
 from deep_translator import GoogleTranslator
@@ -313,17 +315,115 @@ def adjust_audio_speed(input_path: Path, target_s: float, output_path: Path) -> 
         shutil.copy(str(input_path), str(output_path))
 
 
+GTTS_LANG_MAP: dict[str, str] = {
+    "es": "es", "en": "en", "fr": "fr", "de": "de",
+    "it": "it", "pt": "pt", "ru": "ru",
+    "zh-CN": "zh-CN", "ja": "ja", "ar": "ar",
+}
+
+
+def _pitch_shift(input_path: Path, output_path: Path, semitones: float) -> None:
+    """Ajusta el tono del audio con ffmpeg (para distinguir género en gTTS)."""
+    rate = 44100
+    factor = 2 ** (semitones / 12)
+    new_rate = int(rate * factor)
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(input_path),
+         "-af", f"asetrate={new_rate},aresample={rate}",
+         str(output_path)],
+        capture_output=True,
+    )
+    if r.returncode != 0 or not output_path.exists():
+        shutil.copy(str(input_path), str(output_path))
+
+
+async def _tts_generate(
+    text: str,
+    edge_voice: str,
+    lang_code: str,
+    gender: str,
+    speaker_index: int,
+    output_path: Path,
+    tmpdir: Path,
+) -> bool:
+    """
+    Intenta edge-tts (3 reintentos). Si falla, usa gTTS como fallback.
+    Ajusta el tono de gTTS para distinguir género y diferentes hablantes.
+    Devuelve True si se generó audio con éxito.
+    """
+    clean = text.strip()
+    if not clean:
+        return False
+
+    # ── Intento 1-3: edge-tts ─────────────────────────────────────────────
+    for attempt in range(3):
+        try:
+            raw = tmpdir / f"{output_path.stem}_edge_raw.mp3"
+            await edge_tts.Communicate(clean, edge_voice).save(str(raw))
+            if raw.exists() and raw.stat().st_size > 0:
+                shutil.copy(str(raw), str(output_path))
+                logger.debug(f"edge-tts OK (intento {attempt+1})")
+                return True
+        except Exception as e:
+            logger.warning(f"edge-tts intento {attempt+1} fallido: {e}")
+            if attempt < 2:
+                await asyncio.sleep(1.0)
+
+    # ── Fallback: gTTS ────────────────────────────────────────────────────
+    logger.info("Usando gTTS como fallback.")
+    try:
+        gtts_lang = GTTS_LANG_MAP.get(lang_code, "en")
+        loop = asyncio.get_event_loop()
+        raw_gtts = tmpdir / f"{output_path.stem}_gtts_raw.mp3"
+
+        def _run_gtts():
+            gTTS(text=clean, lang=gtts_lang).save(str(raw_gtts))
+
+        await loop.run_in_executor(None, _run_gtts)
+
+        if not raw_gtts.exists() or raw_gtts.stat().st_size == 0:
+            return False
+
+        # Ajustar tono: mujeres +3 st, hombre secundario -2 st, etc.
+        if gender == "female":
+            semitones = 3.0 + speaker_index * 1.5
+        else:
+            semitones = -2.0 * speaker_index  # 0, -2, -4...
+
+        if semitones != 0:
+            pitched = tmpdir / f"{output_path.stem}_pitched.mp3"
+            _pitch_shift(raw_gtts, pitched, semitones)
+            src = pitched if pitched.exists() else raw_gtts
+        else:
+            src = raw_gtts
+
+        shutil.copy(str(src), str(output_path))
+        return output_path.exists() and output_path.stat().st_size > 0
+
+    except Exception as e:
+        logger.warning(f"gTTS también falló: {e}")
+        return False
+
+
 async def generate_dubbed_audio(
     segments: list,
     lang_code: str,
     speaker_ids: list[int],
     voice_map: dict[int, str],
+    speaker_genders: dict[int, str],
     total_duration_s: float,
     tmpdir: Path,
 ) -> Path:
-    """Genera el audio completo doblado: TTS por segmento, sincronizado por timestamp."""
-    fallback_voices = EDGE_VOICES.get(lang_code, EDGE_VOICES["en"])
-    fallback_voice  = fallback_voices["male"][0]
+    """Genera el audio doblado completo sincronizado con los timestamps de Whisper."""
+    fallback_voice = EDGE_VOICES.get(lang_code, EDGE_VOICES["en"])["male"][0]
+
+    # Índice por género para distinguir voces en el fallback gTTS
+    gender_counter: dict[str, int] = {"male": 0, "female": 0}
+    spk_index_map: dict[int, int] = {}
+    for spk_id in sorted(set(speaker_ids)):
+        g = speaker_genders.get(spk_id, "male")
+        spk_index_map[spk_id] = gender_counter[g]
+        gender_counter[g] += 1
 
     total_ms = int(total_duration_s * 1000) + 500
     dubbed   = AudioSegment.silent(duration=total_ms)
@@ -334,21 +434,25 @@ async def generate_dubbed_audio(
             continue
 
         voice    = voice_map.get(spk_id, fallback_voice)
+        gender   = speaker_genders.get(spk_id, "male")
+        spk_idx  = spk_index_map.get(spk_id, 0)
         start_ms = int(seg["start"] * 1000)
         target_s = seg["end"] - seg["start"]
 
-        raw_path = tmpdir / f"tts_raw_{i}.mp3"
+        raw_path = tmpdir / f"tts_{i}.mp3"
         adj_path = tmpdir / f"tts_adj_{i}.mp3"
 
+        ok = await _tts_generate(text, voice, lang_code, gender, spk_idx, raw_path, tmpdir)
+        if not ok:
+            logger.warning(f"Sin audio para segmento {i}, se omite.")
+            continue
+
+        adjust_audio_speed(raw_path, target_s, adj_path)
+        src = adj_path if adj_path.exists() else raw_path
         try:
-            await edge_tts.Communicate(text, voice).save(str(raw_path))
-            if not raw_path.exists() or raw_path.stat().st_size == 0:
-                continue
-            adjust_audio_speed(raw_path, target_s, adj_path)
-            src = adj_path if adj_path.exists() else raw_path
             dubbed = dubbed.overlay(AudioSegment.from_file(str(src)), position=start_ms)
         except Exception as e:
-            logger.warning(f"TTS error segmento {i}: {e}")
+            logger.warning(f"Error mezclando segmento {i}: {e}")
 
     out = tmpdir / "dubbed_audio.mp3"
     dubbed.export(str(out), format="mp3", bitrate="128k")
@@ -579,7 +683,7 @@ async def process_video(
                     )
                     try:
                         dubbed_audio = await generate_dubbed_audio(
-                            segments, lang_code, speaker_ids, voice_map, total_s, tmp
+                            segments, lang_code, speaker_ids, voice_map, genders, total_s, tmp
                         )
                         dubbed_video = tmp / f"dubbed_{lang_code}.mp4"
                         mix_audio_into_video(video_path, dubbed_audio, dubbed_video)
