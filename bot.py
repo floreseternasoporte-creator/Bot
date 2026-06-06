@@ -91,7 +91,7 @@ def format_timestamp(seconds: float) -> str:
 
 
 def build_srt(segments: list, source_lang: str, target_lang: str) -> str:
-    lines = []
+    entries = []
     idx = 1
     for seg in segments:
         text = seg["text"].strip()
@@ -103,21 +103,25 @@ def build_srt(segments: list, source_lang: str, target_lang: str) -> str:
                 text = translated or text
             except Exception as e:
                 logger.warning(f"Error traduciendo: {e}")
-        lines.append(str(idx))
-        lines.append(f"{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}")
-        lines.append(text)
-        lines.append("")
+        entry = (
+            f"{idx}\n"
+            f"{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}\n"
+            f"{text}"
+        )
+        entries.append(entry)
         idx += 1
-    return "\n".join(lines)
+    return "\n\n".join(entries) + "\n"
 
 
 def burn_subtitles(video_path: Path, srt_path: Path, output_path: Path) -> None:
-    """Quema el archivo SRT en el video usando ffmpeg."""
-    srt_escaped = str(srt_path).replace("\\", "/").replace(":", "\\:")
+    """Quema el archivo SRT en el video usando ffmpeg con ruta relativa."""
+    srt_filename = srt_path.name
+    style = "FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=1"
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
-        "-vf", f"subtitles='{srt_escaped}':force_style='FontSize=22,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2'",
+        "-vf", f"subtitles={srt_filename}:force_style='{style}'",
+        "-c:v", "libx264",
         "-c:a", "copy",
         "-preset", "fast",
         str(output_path),
