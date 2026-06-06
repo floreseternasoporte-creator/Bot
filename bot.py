@@ -1,37 +1,29 @@
-
 import os
 import logging
-import json
 import tempfile
 from pathlib import Path
 from moviepy.editor import VideoFileClip
-from googletrans import Translator
+from deep_translator import GoogleTranslator
 import whisper
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
-# Environment variables
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-
 if not TELEGRAM_TOKEN:
     logger.error("TELEGRAM_TOKEN no está configurado en las variables de entorno.")
     exit(1)
 
-# Load Whisper model
-logger.info("Cargando modelo Whisper (esto puede tardar un poco)...")
-model = whisper.load_model("base") # Puedes cambiar a "small", "medium", etc. para mejor precisión/velocidad
+logger.info("Cargando modelo Whisper...")
+model = whisper.load_model("base")
 logger.info("Modelo Whisper cargado.")
 
-# Supported languages for translation
 SUPPORTED_LANGUAGES = {
     "es": "Español",
     "en": "Inglés",
@@ -40,172 +32,219 @@ SUPPORTED_LANGUAGES = {
     "it": "Italiano",
     "pt": "Portugués",
     "ru": "Ruso",
-    "zh": "Chino",
+    "zh-CN": "Chino",
     "ja": "Japonés",
     "ar": "Árabe",
 }
 
-# States for conversation handler
-SELECT_LANGUAGE = 0
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message when the command /start is issued."""
-    await update.message.reply_text(
-        "¡Hola! Soy un bot que genera subtítulos para tus videos.\n\n"
-        "Simplemente envíame un video y te preguntaré en qué idioma(s) quieres los subtítulos."
-    )
-
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles video messages: downloads the video and asks for subtitle languages."""
-    user = update.effective_user
-    logger.info(f"Video recibido de {user.full_name} ({user.id})")
-
-    video_file = update.message.video
-    if not video_file:
-        await update.message.reply_text("Por favor, envía un video válido.")
-        return
-
-    # Store file_id in user_data for later use
-    context.user_data["video_file_id"] = video_file.file_id
-    context.user_data["video_mime_type"] = video_file.mime_type
-
+def build_language_keyboard(selected: list) -> InlineKeyboardMarkup:
     keyboard = []
-    for lang_code, lang_name in SUPPORTED_LANGUAGES.items():
-        keyboard.append([InlineKeyboardButton(lang_name, callback_data=f"lang_{lang_code}")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        "He recibido tu video. Ahora, por favor, selecciona el idioma o los idiomas en los que deseas los subtítulos.\n\n" 
-        "Puedes seleccionar varios idiomas uno por uno.",
-        reply_markup=reply_markup
-    )
-    return SELECT_LANGUAGE
-
-async def select_language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles language selection from inline keyboard."""
-    query = update.callback_query
-    await query.answer()
-
-    lang_code = query.data.split("_")[1]
-    lang_name = SUPPORTED_LANGUAGES.get(lang_code)
-
-    if "selected_languages" not in context.user_data:
-        context.user_data["selected_languages"] = []
-    
-    if lang_code not in context.user_data["selected_languages"]:
-        context.user_data["selected_languages"].append(lang_code)
-        await query.edit_message_text(text=f"Has seleccionado: {lang_name}. Puedes seleccionar más o enviar /done cuando hayas terminado.")
-    else:
-        await query.edit_message_text(text=f"Ya habías seleccionado: {lang_name}. Puedes seleccionar más o enviar /done cuando hayas terminado.")
-    
-    return SELECT_LANGUAGE
-
-async def done_selecting_languages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Processes the selected languages and starts transcription/translation."""
-    user = update.effective_user
-    selected_languages = context.user_data.get("selected_languages", [])
-    video_file_id = context.user_data.get("video_file_id")
-    video_mime_type = context.user_data.get("video_mime_type")
-
-    if not video_file_id or not selected_languages:
-        await update.message.reply_text("Parece que no se ha subido ningún video o no se han seleccionado idiomas. Por favor, envía un video y selecciona los idiomas.")
-        return
-
-    await update.message.reply_text(f"¡Entendido! Generando subtítulos en {", ".join([SUPPORTED_LANGUAGES[lang] for lang in selected_languages])}. Esto puede tardar un poco...")
-
-    try:
-        # Download the video
-        new_file = await context.bot.get_file(video_file_id)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            video_path = Path(tmpdir) / f"{video_file_id}.mp4"
-            await new_file.download_to_drive(video_path)
-            logger.info(f"Video descargado a {video_path}")
-
-            # Extract audio
-            audio_path = Path(tmpdir) / f"{video_file_id}.mp3"
-            clip = VideoFileClip(str(video_path))
-            clip.audio.write_audiofile(str(audio_path))
-            clip.close()
-            logger.info(f"Audio extraído a {audio_path}")
-
-            # Transcribe audio using Whisper
-            await update.message.reply_text("Transcribiendo audio con Whisper (local)...")
-            result = model.transcribe(str(audio_path))
-            logger.info("Transcripción completada.")
-            
-            # Generate SRT for each selected language
-            translator = Translator()
-            for lang_code in selected_languages:
-                srt_content = ""
-                for i, segment in enumerate(result["segments"]):
-                    start_time = segment["start"]
-                    end_time = segment["end"]
-                    text = segment["text"].strip()
-
-                    # Translate if not the original language (Whisper detects language, but we'll assume English for simplicity or translate if different)
-                    # For a more robust solution, detect source language of transcript first if needed
-                    translated_text = text
-                    if lang_code != result["language"]:
-                        await update.message.reply_text(f"Traduciendo a {SUPPORTED_LANGUAGES[lang_code]}...")
-                        translated_obj = translator.translate(text, dest=lang_code, src=result["language"])
-                        translated_text = translated_obj.text
-
-                    srt_content += f"{i + 1}\n"
-                    srt_content += f"{format_timestamp(start_time)} --> {format_timestamp(end_time)}\n"
-                    srt_content += f"{translated_text}\n\n"
-                
-                srt_filename = f"subtitles_{lang_code}.srt"
-                srt_path = Path(tmpdir) / srt_filename
-                with open(srt_path, "w", encoding="utf-8") as f:
-                    f.write(srt_content)
-                
-                await update.message.reply_document(document=srt_path, caption=f"Subtítulos en {SUPPORTED_LANGUAGES[lang_code]}")
-                logger.info(f"Subtítulos en {SUPPORTED_LANGUAGES[lang_code]} enviados.")
-
-    except Exception as e:
-        logger.error(f"Error al procesar el video: {e}", exc_info=True)
-        await update.message.reply_text(f"Ocurrió un error al procesar tu video: {e}")
-    finally:
-        # Clear user data for the next video
-        if "video_file_id" in context.user_data:
-            del context.user_data["video_file_id"]
-        if "selected_languages" in context.user_data:
-            del context.user_data["selected_languages"]
-        if "video_mime_type" in context.user_data:
-            del context.user_data["video_mime_type"]
+    row = []
+    for code, name in SUPPORTED_LANGUAGES.items():
+        mark = "✅ " if code in selected else ""
+        row.append(InlineKeyboardButton(f"{mark}{name}", callback_data=f"lang_{code}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    if selected:
+        keyboard.append([InlineKeyboardButton("🚀 Generar subtítulos", callback_data="generate")])
+    return InlineKeyboardMarkup(keyboard)
 
 
 def format_timestamp(seconds: float) -> str:
-    """Formats seconds into SRT time format (HH:MM:SS,ms)."""
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
-    milliseconds = int((seconds - int(seconds)) * 1000)
-    return f"{hours:02}:{minutes:02}:{secs:02},{milliseconds:03}"
+    ms = int((seconds - int(seconds)) * 1000)
+    return f"{hours:02}:{minutes:02}:{secs:02},{ms:03}"
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and send a telegram message to notify the user."""
-    logger.error("Exception while handling an update:", exc_info=context.error)
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            "¡Ups! Ha ocurrido un error. Por favor, inténtalo de nuevo más tarde."
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "👋 ¡Hola! Soy un bot de transcripción de videos.\n\n"
+        "Envíame un video y selecciona el idioma (o idiomas) en los que quieres los subtítulos. "
+        "Te devolveré un archivo .srt con la transcripción.\n\n"
+        "Comandos:\n"
+        "/start — Mostrar este mensaje\n"
+        "/help — Ayuda"
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "📖 *Cómo usar el bot:*\n\n"
+        "1. Envíame un video\n"
+        "2. Selecciona uno o más idiomas para los subtítulos\n"
+        "3. Pulsa *Generar subtítulos*\n"
+        "4. Recibirás un archivo .srt por cada idioma seleccionado\n\n"
+        "El bot usa Whisper (IA local) para transcribir el audio del video.",
+        parse_mode="Markdown"
+    )
+
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    video = update.message.video
+
+    if not video:
+        await update.message.reply_text("Por favor, envía un archivo de video válido.")
+        return
+
+    logger.info(f"Video recibido de {user.full_name} ({user.id}), file_id={video.file_id}")
+
+    context.user_data["video_file_id"] = video.file_id
+    context.user_data["selected_languages"] = []
+
+    await update.message.reply_text(
+        "✅ Video recibido. Selecciona el idioma o idiomas para los subtítulos y pulsa *Generar subtítulos*:",
+        parse_mode="Markdown",
+        reply_markup=build_language_keyboard([])
+    )
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    video_file_id = context.user_data.get("video_file_id")
+
+    if not video_file_id:
+        await query.edit_message_text("⚠️ No hay ningún video activo. Por favor, envía un video primero.")
+        return
+
+    if data.startswith("lang_"):
+        lang_code = data[len("lang_"):]
+        selected = context.user_data.setdefault("selected_languages", [])
+
+        if lang_code in selected:
+            selected.remove(lang_code)
+        else:
+            selected.append(lang_code)
+
+        await query.edit_message_text(
+            "Selecciona el idioma o idiomas para los subtítulos y pulsa *Generar subtítulos*:",
+            parse_mode="Markdown",
+            reply_markup=build_language_keyboard(selected)
         )
 
+    elif data == "generate":
+        selected = context.user_data.get("selected_languages", [])
+
+        if not selected:
+            await query.answer("Selecciona al menos un idioma primero.", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            f"⏳ Procesando video en {', '.join(SUPPORTED_LANGUAGES[l] for l in selected)}...\n"
+            "Esto puede tardar varios minutos dependiendo del tamaño del video."
+        )
+
+        await process_video(query.message, context, video_file_id, selected)
+
+        context.user_data.pop("video_file_id", None)
+        context.user_data.pop("selected_languages", None)
+
+
+async def process_video(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    video_file_id: str,
+    selected_languages: list
+) -> None:
+    try:
+        new_file = await context.bot.get_file(video_file_id)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "video.mp4"
+            await new_file.download_to_drive(video_path)
+            logger.info(f"Video descargado: {video_path}")
+
+            audio_path = Path(tmpdir) / "audio.mp3"
+            clip = VideoFileClip(str(video_path))
+            if clip.audio is None:
+                await message.reply_text("❌ El video no tiene audio.")
+                clip.close()
+                return
+            clip.audio.write_audiofile(str(audio_path), logger=None)
+            clip.close()
+            logger.info("Audio extraído.")
+
+            await message.reply_text("🎙️ Transcribiendo audio con Whisper...")
+            result = model.transcribe(str(audio_path))
+            source_lang = result.get("language", "en")
+            segments = result.get("segments", [])
+            logger.info(f"Transcripción completada. Idioma detectado: {source_lang}")
+
+            if not segments:
+                await message.reply_text("❌ No se detectó habla en el video.")
+                return
+
+            for lang_code in selected_languages:
+                lang_name = SUPPORTED_LANGUAGES[lang_code]
+                await message.reply_text(f"📝 Generando subtítulos en {lang_name}...")
+
+                srt_lines = []
+                for i, seg in enumerate(segments, start=1):
+                    text = seg["text"].strip()
+                    if not text:
+                        continue
+
+                    if lang_code.lower() != source_lang.lower():
+                        try:
+                            translated = GoogleTranslator(
+                                source=source_lang,
+                                target=lang_code
+                            ).translate(text)
+                            text = translated or text
+                        except Exception as e:
+                            logger.warning(f"Error traduciendo segmento: {e}")
+
+                    srt_lines.append(str(i))
+                    srt_lines.append(f"{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}")
+                    srt_lines.append(text)
+                    srt_lines.append("")
+
+                srt_content = "\n".join(srt_lines)
+                srt_path = Path(tmpdir) / f"subtitles_{lang_code}.srt"
+                srt_path.write_text(srt_content, encoding="utf-8")
+
+                await message.reply_document(
+                    document=srt_path,
+                    caption=f"✅ Subtítulos en {lang_name}"
+                )
+                logger.info(f"Enviados subtítulos en {lang_name}.")
+
+            await message.reply_text("✅ ¡Listo! Envía otro video cuando quieras.")
+
+    except Exception as e:
+        logger.error(f"Error procesando video: {e}", exc_info=True)
+        await message.reply_text(f"❌ Error al procesar el video: {e}")
+
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Error no controlado:", exc_info=context.error)
+    if update and update.effective_message:
+        await update.effective_message.reply_text(
+            "⚠️ Ocurrió un error inesperado. Por favor, inténtalo de nuevo."
+        )
+
+
 def main() -> None:
-    """Start the bot."""
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video))
-    application.add_handler(CallbackQueryHandler(select_language_callback, pattern="^lang_"))
-    application.add_handler(CommandHandler("done", done_selecting_languages))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_error_handler(error_handler)
 
-    # Error handler
-    application.add_error_handler(error_handler)
+    logger.info("Bot iniciado.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    # Run the bot until the user presses Ctrl-C
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
