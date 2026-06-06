@@ -5,4 +5,8 @@ torchvision
 torchaudio
 moviepy
 deep-translator
+edge-tts
+librosa
+pydub
+numpy
 setuptools
