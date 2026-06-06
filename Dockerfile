@@ -2,7 +2,6 @@ FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# Instalar ffmpeg y dependencias de sistema necesarias
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     build-essential \
@@ -13,6 +12,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 
-ENV TELEGRAM_TOKEN="your_telegram_token_here"
+EXPOSE 8080
 
 CMD ["python", "bot.py"]

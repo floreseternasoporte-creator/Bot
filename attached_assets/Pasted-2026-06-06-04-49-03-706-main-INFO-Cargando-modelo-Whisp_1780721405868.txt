@@ -1,0 +1,47 @@
+2026-06-06 04:49:03,706 - __main__ - INFO - Cargando modelo Whisper...
+
+  0%|                                               | 0.00/139M [00:00<?, ?iB/s]
+ 24%|█████████▏                             | 32.8M/139M [00:00<00:00, 344MiB/s]
+ 48%|██████████████████▌                    | 65.8M/139M [00:00<00:00, 334MiB/s]
+ 72%|████████████████████████████           | 99.5M/139M [00:00<00:00, 342MiB/s]
+ 99%|███████████████████████████████████████▍| 137M/139M [00:00<00:00, 360MiB/s]
+100%|████████████████████████████████████████| 139M/139M [00:00<00:00, 352MiB/s]
+2026-06-06 04:49:09,786 - __main__ - INFO - Modelo Whisper cargado.
+2026-06-06 04:49:09,895 - __main__ - INFO - Bot iniciado.
+2026-06-06 04:49:10,502 - telegram.ext.Application - INFO - Application started
+2026-06-06 04:49:22,065 - __main__ - ERROR - Error no controlado:
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/site-packages/telegram/ext/_updater.py", line 753, in _network_loop_retry
+    if not await do_action():
+           ^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/telegram/ext/_updater.py", line 747, in do_action
+    return action_cb_task.result()
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/telegram/ext/_updater.py", line 377, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/telegram/ext/_extbot.py", line 649, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/telegram/_bot.py", line 4366, in get_updates
+    await self._post(
+  File "/usr/local/lib/python3.11/site-packages/telegram/_bot.py", line 623, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/telegram/ext/_extbot.py", line 355, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/telegram/_bot.py", line 652, in _do_post
+    result = await request.post(
+             ^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/telegram/request/_baserequest.py", line 201, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/telegram/request/_baserequest.py", line 384, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-06-06 04:49:31,943 - __main__ - INFO - Video de x_narayandv (5405419080), file_id=BAACAgEAAxkBAAIDDGojpkTstlAv-9v5MPi9tsptPdgsAAJxBwACYxEhReIiMvUJgLNuOwQ
+2026-06-06 04:49:40,449 - __main__ - INFO - Video descargado: /tmp/tmpipkwoqfn/video.mp4
+2026-06-06 04:49:40,554 - __main__ - INFO - Audio extraído.
+/usr/local/lib/python3.11/site-packages/whisper/transcribe.py:132: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")

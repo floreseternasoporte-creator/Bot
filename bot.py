@@ -343,6 +343,10 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ── Arranque ──────────────────────────────────────────────────────────────────
 
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+PORT = int(os.environ.get("PORT", 8080))
+
+
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -352,8 +356,19 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
 
-    logger.info("Bot iniciado.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    if WEBHOOK_URL:
+        logger.info(f"Modo webhook: {WEBHOOK_URL} — puerto {PORT}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TELEGRAM_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}",
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        logger.info("Modo polling (desarrollo local).")
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
